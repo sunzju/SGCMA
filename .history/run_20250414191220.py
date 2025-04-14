@@ -16,8 +16,6 @@ from models import SGCMA
 from data_provider.data_factory import data_provider
 from utils.tools import text_data_provider, remap_tokens_to_local_vocab, del_files, EarlyStopping, adjust_learning_rate, vali
 
-# change something
-
 """环境变量"""
 os.environ['CURL_CA_BUNDLE'] = ''  # 禁用 SSL 证书验证
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"  # 设置 PyTorch 内存分配策略
