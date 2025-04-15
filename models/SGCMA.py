@@ -470,10 +470,9 @@ class Model(nn.Module):
             dec_out = self.normalize_layers(dec_out, 'denorm')
             return dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
         else:
-            text_pi = F.softmax(epoch_init_logits, dim=0)
-            text_A = F.softmax(epoch_transition_logits, dim =1)
-            text_B = F.softmax(epoch_emission_logits, dim=1)
-            hmm_loss = 0
+            text_pi = F.softmax(self.wiki_hmm.init_logits.detach(), dim=0)
+            text_A = F.softmax(self.wiki_hmm.transition_logits.detach(), dim =1)
+            text_B = F.softmax(self.wiki_hmm.emission_logits.detach(), dim=1)
 
             _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1)
             topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
@@ -493,7 +492,7 @@ class Model(nn.Module):
             dec_out = self.output_projection(dec_out)  
             dec_out = dec_out.permute(0, 2, 1).contiguous()  
             dec_out = self.normalize_layers(dec_out, 'denorm')
-            return dec_out, hmm_loss, entropy_loss
+            return dec_out, 0, 0, 0, entropy_loss
 
 # if __name__ == "__main__":
 #     n_cls, d_model, d_keys, n_heads, d_llm = 100, 128, 64, 12, 768

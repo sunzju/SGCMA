@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument('--hidden_state_num', type=int, default=100, help='hmm hidden_state_num')
     parser.add_argument('--colsum_threshold', type=float, default=0.2, help='hidden_state arrived lower bound logits')
     parser.add_argument('--text_batch_size', type=int, default=1024, help='batch size of wikipedia data')
+    parser.add_argument('--vocab_size', type=int, default=50256, help='vocab size')
 
     # ts data loader
     parser.add_argument('--data', type=str, default='ETTh1', help='datasets type')
@@ -94,8 +95,7 @@ def parse_args():
     parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
     parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
     parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
-    parser.add_argument('--moving_avg', type=int, default=30, help='window size of moving average')
-    parser.add_argument('--factor', type=int, default=1, help='attn factor')
+
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--embed', type=str, default='timeF',
                         help='time features encoding, options:[timeF, fixed, learned]')
@@ -108,7 +108,8 @@ def parse_args():
     parser.add_argument('--topk', type=int, default=32, help='topk')
     parser.add_argument('--topkmode', type=str, default='select', help='select or all')
     parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
-    parser.add_argument('--hmm_pretrained_flag', type=int, default=0, help='is pretrain')
+    parser.add_argument('--hmm_pretrained_flag', type=int, default=1, help='is pretrain')
+    parser.add_argument('--load_hmm_flag', type=int, default=1, help='is load hmm')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
@@ -118,7 +119,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='batch size of model evaluation')
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
@@ -144,18 +145,17 @@ def main():
 
     # 加载映射字典
     gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
-    vocab_size = 50256
-    gpt2_to_local = torch.full((vocab_size,), -1, dtype=torch.int32)
+    gpt2_to_local = torch.full((args.vocab_size,), -1, dtype=torch.int32)
     for gpt2_id, local_id in gpt2_to_local_id.items():
         gpt2_to_local[gpt2_id] = local_id  # [50256,], 没出现的id是-1
     gpt2_to_local = gpt2_to_local.to(device)
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_df{}_fc{}_eb{}_cn{}_tk{}_tkm{}_{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_df{}_eb{}_cn{}_tk{}_tkm{}_{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
             args.seq_len, args.label_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.factor, args.embed, args.cluster_num, args.topk, args.topkmode, ii)
+            args.e_layers, args.d_ff, args.embed, args.cluster_num, args.topk, args.topkmode, ii)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -181,34 +181,35 @@ def main():
         # 损失函数
         criterion = nn.MSELoss()
         mae_metric = nn.L1Loss()
-        
-        
-        if args.hmm_pretrained_flag:
-            pretrain_hmm_path = os.path.join(args.pretrain_hmm_path, 'hmm_checkpoint.pth')
+
+        checkpoint_path = os.path.join(check_pth, 'checkpoint')
+        if os.path.exists(checkpoint_path):
+            print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint)  # 加载模型状态
+            print(f"Loaded from {checkpoint_path}")
+        else:
+            print("No checkpoint found. Starting Phase 1 from scratch.")        
+
+        _, text_dataloader = text_data_provider(args)
+
+        if args.load_hmm_flag:
+            pretrain_hmm_path = os.path.join(check_pth, 'hmm_checkpoint.pth')
             if os.path.exists(pretrain_hmm_path):
-                print(f"Pretrained HMM found at {pretrain_hmm_path}. Skipping Phase 1.")
+                print(f"Pretrained HMM found at {pretrain_hmm_path}.")
                 full_model_state = torch.load(pretrain_hmm_path, map_location=device)
                 model.wiki_hmm.load_state_dict(full_model_state)
-            else:
-                print("No pretrained HMM found. Starting Phase 1 from scratch.")
-        else:
-            checkpoint_path = os.path.join(check_pth, 'checkpoint')
-            if os.path.exists(checkpoint_path):
-                print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
-                checkpoint = torch.load(checkpoint_path, map_location=device)
-                model.load_state_dict(checkpoint)  # 加载模型状态
-                print(f"Loaded from {checkpoint_path}")
-            else:
-                print("No checkpoint found. Starting Phase 1 from scratch.")        
+
+        if not args.hmm_pretrained_flag:
             # === Phase 1: Train text HMM for 5 epochs ===
             print("Starting Phase 1: Training text HMM for 5 epochs")
-            _, text_dataloader = text_data_provider(args)
+
             model.train()
             for epoch in range(args.pretrain_epochs):  
                 epoch_time = time.time()
                 epoch_loss = 0.0
                 iter_text_dataloader = iter(text_dataloader)
-                with tqdm(range(2000), desc=f"Text Epoch {epoch + 1}") as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
+                with tqdm(range(len(text_dataloader)), desc=f"Text Epoch {epoch + 1}") as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
                     for batch_idx in pbar:
                         sentences = next(iter_text_dataloader)
                         sentences = sentences.to(device)
@@ -219,31 +220,34 @@ def main():
                         hmm_loss.backward()
                         model_optim.step()
                         epoch_loss += hmm_loss.item()
-                        pbar.set_postfix({'loss': epoch_loss / (batch_idx + 1)})
+                        pbar.set_postfix({'loss': hmm_loss.item()})
+                        if batch_idx % 1000 == 999:
+                            with torch.no_grad():
+                                transition_logits = model.wiki_hmm.transition_logits.detach().cpu()
+                                transition_matrix = torch.softmax(transition_logits, dim=1).numpy()  # 转换为概率矩阵
+
+                                # 绘制状态转移矩阵热力图
+                                plt.figure(figsize=(12, 10))
+                                sns.heatmap(transition_matrix, cmap='Reds', linewidths=0.1, linecolor='white',annot=False, fmt=".2f", 
+                                            xticklabels=False, yticklabels=False, cbar=True)
+                                plt.title("State Transition Matrix")
+                                plt.xlabel("Next State")
+                                plt.ylabel("Current State")
+                                plt.savefig(os.path.join(check_pth, f'transition_matrix_heatmap_{epoch + 1}-{batch_idx}.png'), bbox_inches="tight")
+                                plt.close()
+
                 
-                avg_train_loss = epoch_loss / 2000
+                avg_train_loss = epoch_loss / len(text_dataloader)
+                logger.info(f"Text Epoch {epoch + 1} cost time: {time.time() - epoch_time}")
+                logger.info(f"Text Epoch {epoch + 1} Average Loss: {avg_train_loss:.7f}")
 
 
-                # 加载状态转移矩阵
-                transition_logits = model.wiki_hmm.transition_logits.detach().cpu()
-                transition_matrix = torch.softmax(transition_logits, dim=1).numpy()  # 转换为概率矩阵
 
-                # 绘制状态转移矩阵热力图
-                plt.figure(figsize=(12, 10))
-                sns.heatmap(transition_matrix, cmap='Reds', linewidths=0.1, linecolor='white',annot=False, fmt=".2f", 
-                            xticklabels=False, yticklabels=False, cbar=True)
-                plt.title("State Transition Matrix")
-                plt.xlabel("Next State")
-                plt.ylabel("Current State")
-                plt.savefig(os.path.join(check_pth, f'transition_matrix_heatmap_{epoch + 1}.png'), bbox_inches="tight")
-                plt.close()
-                print(f"Text Epoch {epoch + 1} cost time: {time.time() - epoch_time}")
-                print(f"Text Epoch {epoch + 1} Average Loss: {avg_train_loss:.7f}")
 
                 # 保存当前epoch的模型和状态
-            hmm_checkpoint = model.wiki_hmm.state_dict()
-            torch.save(hmm_checkpoint, os.path.join(check_pth, f'hmm_checkpoint.pth'))
-            print(f"Saved checkpoint for hmm pretraining")
+                hmm_checkpoint = model.wiki_hmm.state_dict()
+                torch.save(hmm_checkpoint, os.path.join(check_pth, f'hmm_checkpoint.pth'))
+                print(f"Saved checkpoint for hmm pretraining")
 
 
 
@@ -299,7 +303,7 @@ def main():
                 model_optim.step()
 
                 train_loss += loss.cpu().detach().item()
-                train_hmm_loss += hmm_loss.cpu().detach().item()
+                train_hmm_loss += likelihood_loss.cpu().detach().item()
                 train_mseloss += mseloss.cpu().detach().item()
                 train_entropy_loss += entropy_loss.cpu().detach().item()
                 
@@ -313,9 +317,9 @@ def main():
                 })
 
                 if batch_idx % 200 == 199:
-                    torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
-                    torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
-                    torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
+                    # torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
+                    # torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
+                    # torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
                     vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
                     test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
                     print('')

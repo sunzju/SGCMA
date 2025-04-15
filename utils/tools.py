@@ -8,6 +8,8 @@ from tqdm import tqdm
 import h5py
 import os
 
+from models import SGCMA
+
 plt.switch_backend('agg')
 
 """文本HMM相关函数定义"""
@@ -139,18 +141,18 @@ def adjustment(gt, pred):
 def del_files(dir_path):
     shutil.rmtree(dir_path)
 
-def vali(args, model, vali_data, vali_loader, criterion, mae_metric):
+def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric):
     device = next(model.parameters()).device
     total_mseloss = []
     total_mae_loss = []
 
     # 加载保存的 emission_logits
-    init_logits_path = os.path.join('pretrain_model/vali', 'epoch_init_logits.pt')
-    transition_logits_path = os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt')
-    emission_logits_path = os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt')
-    epoch_init_logits = torch.load(init_logits_path).to(device)
-    epoch_transition_logits = torch.load(transition_logits_path).to(device)
-    epoch_emission_logits = torch.load(emission_logits_path).to(device)
+    # init_logits_path = os.path.join('pretrain_model/vali', 'epoch_init_logits.pt')
+    # transition_logits_path = os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt')
+    # emission_logits_path = os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt')
+    # epoch_init_logits = torch.load(init_logits_path).to(device)
+    # epoch_transition_logits = torch.load(transition_logits_path).to(device)
+    # epoch_emission_logits = torch.load(emission_logits_path).to(device)
 
     model.eval()
     with torch.no_grad():
@@ -163,11 +165,11 @@ def vali(args, model, vali_data, vali_loader, criterion, mae_metric):
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(device)
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
 
-            outputs, _ , _= model(batch_x, 
+            outputs, _ ,_, _, _= model(batch_x, 
                                   text_input=None, 
-                                  epoch_init_logits=epoch_init_logits, 
-                                  epoch_transition_logits=epoch_transition_logits, 
-                                  epoch_emission_logits=epoch_emission_logits)
+                                  epoch_init_logits=model.wiki_hmm.init_logits, 
+                                  epoch_transition_logits=model.wiki_hmm.transition_logits, 
+                                  epoch_emission_logits=model.wiki_hmm.emission_logits)
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
