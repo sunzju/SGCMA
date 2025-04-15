@@ -13,6 +13,9 @@ from layers.StandardNorm import Normalize
 # # 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
 log_dir = "log"  
 os.makedirs(log_dir, exist_ok=True)
+# # 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
+log_dir = "log"  
+os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "training.log")  
 # 自定义 Logger
 logger = logging.getLogger('SGCMA_Training')
@@ -33,8 +36,12 @@ logger.addHandler(console_handler)
 class WikiHMM(nn.Module):
     # def __init__(self, hidden_state_num, colsum_threshold, diag_max=0.7, token_num=50003):
     def __init__(self, hidden_state_num, diag_max=0.7, token_num=50003):
+    # def __init__(self, hidden_state_num, colsum_threshold, diag_max=0.7, token_num=50003):
+    def __init__(self, hidden_state_num, diag_max=0.7, token_num=50003):
         super(WikiHMM, self).__init__()
         self.hidden_state_num = hidden_state_num
+        # self.colsum_threshold = colsum_threshold  
+        self.diag_max = diag_max
         # self.colsum_threshold = colsum_threshold  
         self.diag_max = diag_max
 
@@ -245,8 +252,15 @@ class TSAligner(nn.Module):
         #     for _ in range(cluster_num)
         # ])
         self.crossattention_layers = CrossAttentionLayer(d_model, n_heads, cluster_num, d_llm=d_llm, attention_dropout=attention_dropout)
+        # self.crossattention_layers = nn.ModuleList([
+        #     CrossAttentionLayer(d_model, n_heads, d_llm=d_llm, attention_dropout=attention_dropout)
+        #     for _ in range(cluster_num)
+        # ])
+        self.crossattention_layers = CrossAttentionLayer(d_model, n_heads, cluster_num, d_llm=d_llm, attention_dropout=attention_dropout)
 
     def forward(self, topk_token_embeddings, ts_emb, cluster_probs):   
+        # B, P, _ = ts_emb.shape  # [B, patch_num, d_model]
+        # aligned_embs = []
         # B, P, _ = ts_emb.shape  # [B, patch_num, d_model]
         # aligned_embs = []
         # 对每个聚类进行注意力对齐
@@ -260,8 +274,19 @@ class TSAligner(nn.Module):
         #     aligned_embs.append(aligned * weight)  # [B, patch_num, d_llm]
 
         aligned = self.crossattention_layers(ts_emb, topk_token_embeddings, topk_token_embeddings) # [B, patch_num, d_llm, c]
+        # for c in range(self.cluster_num):
+        #     # 获取当前聚类的 top-k token embeddings
+        #     text_emb = topk_token_embeddings[c]  # 第c个cluster的topk_token_embedding  [topk, d_llm]
+        #     # 使用 CrossAttentionLayer 计算对齐嵌入
+        #     aligned = self.crossattention_layers[c](ts_emb, text_emb, text_emb)  # 一段时间序列整个和一个聚类里的topk_token进行注意力计算, scores:[B, H, patch_num, topk]，得到融合文本特征的 [B, patch_num, d_llm]
+        #     # 根据聚类概率加权
+        #     weight = cluster_probs[:, :, [c]]  # [B, patch_num, 1]
+        #     aligned_embs.append(aligned * weight)  # [B, patch_num, d_llm]
+
+        aligned = self.crossattention_layers(ts_emb, topk_token_embeddings, topk_token_embeddings) # [B, patch_num, d_llm, c]
 
         # 融合所有聚类的加权嵌入
+        fused_emb = torch.sum(aligned * cluster_probs[:, :, :, None], dim=-2)  # [B, patch_num, d_llm]
         fused_emb = torch.sum(aligned * cluster_probs[:, :, :, None], dim=-2)  # [B, patch_num, d_llm]
         return fused_emb
     
@@ -275,7 +300,10 @@ class CrossAttentionLayer(nn.Module):
         融合了文本特征且映射到d_llm的时序patch (B, patch_num, d_llm)
     """
     def __init__(self, d_model, n_heads, n_cls=100, d_keys=None, d_llm=None, attention_dropout=0.1):
+    def __init__(self, d_model, n_heads, n_cls=100, d_keys=None, d_llm=None, attention_dropout=0.1):
         super(CrossAttentionLayer, self).__init__()
+
+        self.n_cls = n_cls
 
         self.n_cls = n_cls
 
@@ -286,6 +314,15 @@ class CrossAttentionLayer(nn.Module):
         self.query_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_model + 1)) # +1 用于bias
         self.key_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
         self.value_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
+        self.d_keys = d_keys
+
+        self.query_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_model + 1)) # +1 用于bias
+        self.key_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
+        self.value_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
+
+        # self.out_projection = nn.Linear(d_keys * n_heads, d_llm)  # 将融合了文本原型后的时序patch，映射到LLM的维度，d_model -> d_llm
+        self.out_projection_w = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm))
+        self.out_projection_b = nn.Parameter(torch.randn(n_cls, d_llm))
 
         # self.out_projection = nn.Linear(d_keys * n_heads, d_llm)  # 将融合了文本原型后的时序patch，映射到LLM的维度，d_model -> d_llm
         self.out_projection_w = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm))
@@ -314,7 +351,28 @@ class CrossAttentionLayer(nn.Module):
 
         # out = out.reshape(B, L, -1)    # [B, L, H*d_keys]
         aligned_ts = torch.einsum("bclhd,chde->blce", out_value, self.out_projection_w) + self.out_projection_b # [B, L, n_cls, d_llm]
+        """
+        target_embedding: (B, L, d_model)
+        source_embedding: (n_cluster, k, d_llm)
+        value_embedding: (n_cluster, k, d_llm) the same as source_embedding
+        """
 
+        target_embedding = torch.einsum("bld,ched->blche", target_embedding, self.query_projection[...,:-1]) + self.query_projection[..., -1] # [B, L, c, H, d_keys]
+        source_embedding = torch.einsum("ckd,ched->kche", source_embedding, self.key_projection[...,:-1]) + self.key_projection[..., -1] # [k, c, H, d_keys]
+        value_embedding = torch.einsum("ckd,ched->kche", value_embedding, self.value_projection[...,:-1]) + self.value_projection[..., -1] # [k, c, H, d_keys]
+
+
+        scale = 1. / sqrt(self.d_keys)
+
+        att_score = torch.einsum("blchd,kche->bchlk", target_embedding, source_embedding) # [B, c, H, L, k]
+        att_score = self.dropout(torch.softmax(scale * att_score, dim=-1))
+        out_value = torch.einsum("bchlk,kchd->bclhd", att_score, value_embedding) # [B, c, L, H, d_keys]
+
+        # out = out.reshape(B, L, -1)    # [B, L, H*d_keys]
+        aligned_ts = torch.einsum("bclhd,chde->blce", out_value, self.out_projection_w) + self.out_projection_b # [B, L, n_cls, d_llm]
+
+        return aligned_ts  # [B, L, c, d_llm]
+    
         return aligned_ts  # [B, L, c, d_llm]
     
 
@@ -379,6 +437,7 @@ class Model(nn.Module):
 
         # 加载gpt2_to_local_id字典
         gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
+        gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
         # 创建local_to_gpt2映射tensor
         max_local_id = max(gpt2_to_local_id.values())  # 本地token_id的最大值
         self.local_to_gpt2 = torch.zeros(max_local_id + 1, dtype=torch.long, device=self.device)
@@ -414,14 +473,17 @@ class Model(nn.Module):
         
         
     def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
+    def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
         if is_pretrain:
             _, _, _, hmm_loss= self.wiki_hmm(text_input)
             return hmm_loss
         else:
             dec_out, hmm_loss, entropy_loss = self.forecast(x_enc, text_input)
+            dec_out, hmm_loss, entropy_loss = self.forecast(x_enc, text_input)
             return dec_out[:, -self.pred_len:, :], hmm_loss, entropy_loss
     
         
+    def forecast(self, x_enc, text_input=None):
     def forecast(self, x_enc, text_input=None):
         # 训练时
         if text_input is not None:
@@ -433,6 +495,7 @@ class Model(nn.Module):
             """调用 Normalize 模块: self.normalize_layers"""
             x_enc = self.normalize_layers(x_enc, 'norm')  # [bs, seq_len, n_vars]
 
+
             x_enc = x_enc.permute(0, 2, 1).contiguous()  # [bs, n_vars, seq_len]
 
             """调用 Patching 模块: self.patching"""
@@ -443,10 +506,14 @@ class Model(nn.Module):
 
             """调用 TSCluster 模块: self.ts_cluster"""
             cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, text_pi, text_A)  # [bs*n_vars, patch_num, cluster_num]
+            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, text_pi, text_A)  # [bs*n_vars, patch_num, cluster_num]
 
             """获取word embedding"""
             _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1) # [n_cluster, topk]
+            _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1) # [n_cluster, topk]
             # 直接用tensor索引映射到gpt2_id
+            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
+            topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
             topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
             topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
 
@@ -493,6 +560,20 @@ class Model(nn.Module):
             dec_out = dec_out.permute(0, 2, 1).contiguous()  
             dec_out = self.normalize_layers(dec_out, 'denorm')
             return dec_out, hmm_loss, entropy_loss
+
+# if __name__ == "__main__":
+#     n_cls, d_model, d_keys, n_heads, d_llm = 100, 128, 64, 12, 768
+#     topk = 10
+#     batch_size = 32
+#     patch_num = 11
+#     cross_attention_layer = CrossAttentionLayer(d_model, n_heads, n_cls, d_keys, d_llm)
+#     target_embedding = torch.randn(batch_size, patch_num, d_model)
+#     source_embedding = torch.randn(n_cls, topk, d_llm)
+#     value_embedding = torch.randn(n_cls, topk, d_llm)
+#     cluster_probs = torch.randn(batch_size, patch_num, n_cls)
+#     aligned_ts = cross_attention_layer(target_embedding, source_embedding, value_embedding)
+
+
 
 # if __name__ == "__main__":
 #     n_cls, d_model, d_keys, n_heads, d_llm = 100, 128, 64, 12, 768
