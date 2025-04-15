@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))  # 添加项目根目录到Python路径
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,25 +14,7 @@ import time
 
 from layers.StandardNorm import Normalize
 
-# # 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
-log_dir = "log"  
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "training.log")  
-# 自定义 Logger
-logger = logging.getLogger('SGCMA_Training')
-logger.setLevel(logging.DEBUG)  # 设置全局最低级别为 DEBUG
-# 日志格式
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-# 文件 Handler：输出 DEBUG 及以上到文件
-file_handler = logging.FileHandler(log_file)
-file_handler.setLevel(logging.DEBUG)  # 文件记录 DEBUG 及以上
-file_handler.setFormatter(formatter)
-# 控制台 Handler：仅输出 INFO 及以上
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  
-console_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+
 
 class WikiHMM(nn.Module):
     # def __init__(self, hidden_state_num, colsum_threshold, diag_max=0.7, token_num=50003):
@@ -51,9 +37,9 @@ class WikiHMM(nn.Module):
         text_A = F.softmax(self.transition_logits, dim=1)
         text_B = F.softmax(self.emission_logits, dim=1)
         
-        logger.debug(f"text_pi:{text_pi}")
-        logger.debug(f"text_A: {text_A}")
-        logger.debug(f"text_B: {text_B}")
+        # logger.debug(f"text_pi:{text_pi}")
+        # logger.debug(f"text_A: {text_A}")
+        # logger.debug(f"text_B: {text_B}")
         # 计算状态转移矩阵、发射矩阵信息熵
 
         # === 2. 对数前向算法 （在数值稳定的对数空间进行，因为概率相乘数值会越来越小） ===
@@ -99,10 +85,7 @@ class WikiHMM(nn.Module):
         # diag_reg = torch.sum(F.relu(torch.diag(text_A) - self.diag_max).pow(2))
 
 
-        # === 6. 总损失 ===
-        hmm_loss = likelihood_loss + transition_entropy_loss - cnct_const
-
-        return text_pi, text_A, text_B, hmm_loss
+        return text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const
 
 # FlattenHead：展平并输出预测结果
 class FlattenHead(nn.Module):
@@ -110,13 +93,20 @@ class FlattenHead(nn.Module):
         super().__init__()
         self.n_vars = n_vars
         self.flatten = nn.Flatten(start_dim=-2)
-        self.linear = nn.Linear(nf, target_window)
-        self.dropout = nn.Dropout(head_dropout)
+        self.linear = nn.Sequential(nn.Linear(nf, 512),
+                                    nn.GELU(),
+                                    nn.Dropout(head_dropout),
+                                    nn.Linear(512, 512),
+                                    nn.GELU(),
+                                    nn.Dropout(head_dropout),
+                                    nn.Linear(512, 512),
+                                    nn.GELU(),
+                                    nn.Dropout(head_dropout),
+                                    nn.Linear(512, target_window))
 
     def forward(self, x):  # x: [bs, nvars, d_ff, patch_num]
         x = self.flatten(x)  # x: [bs, nvars, d_ff * patch_num]
         x = self.linear(x)   # x: [bs, nvars, target_window]
-        x = self.dropout(x)
         return x             # x: [bs, nvars, target_window]
 
 class ReplicationPad1d(nn.Module):
@@ -320,7 +310,7 @@ class CrossAttentionLayer(nn.Module):
 
 # 主模型类
 class Model(nn.Module):
-    def __init__(self, configs, patch_len=16, stride=8, cluster_num=100, topk=1000, token_num=50003):
+    def __init__(self, configs):
         super(Model, self).__init__()
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
@@ -328,10 +318,11 @@ class Model(nn.Module):
         self.d_ff = configs.d_ff  
         self.d_llm = configs.llm_dim
         self.d_model = configs.d_model
-        self.patch_len = patch_len
-        self.stride = stride
-        self.cluster_num = cluster_num
-        self.topk = topk
+        self.patch_len = configs.patch_len
+        self.stride = configs.stride
+        self.cluster_num = configs.cluster_num
+        self.topk = configs.topk
+        self.topkmode = configs.topkmode
         self.n_heads = configs.n_heads
         self.epoch_init_logits = None
         self.epoch_transition_logits = None
@@ -342,7 +333,7 @@ class Model(nn.Module):
         if self.patch_num <= 0:
             raise ValueError(f"Invalid patch configuration: seq_len={self.seq_len}, patch_len={self.patch_len}, stride={self.stride}")
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(configs.device if torch.cuda.is_available() else "cpu")
 
         
         self.gpt2_config = GPT2Config.from_pretrained(r'gpt2')
@@ -377,6 +368,8 @@ class Model(nn.Module):
         # 获取 LLM 的全部词嵌入
         self.word_embeddings = self.llm_model.get_input_embeddings().weight  # [50256, d_llm]
 
+
+
         # 加载gpt2_to_local_id字典
         gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
         # 创建local_to_gpt2映射tensor
@@ -384,6 +377,8 @@ class Model(nn.Module):
         self.local_to_gpt2 = torch.zeros(max_local_id + 1, dtype=torch.long, device=self.device)
         for local_id, gpt2_id in enumerate([gpt2_to_local_id[k] for k in sorted(gpt2_to_local_id.keys())]):
             self.local_to_gpt2[local_id] = gpt2_id
+        
+        self.local_word_embeddings = self.word_embeddings[self.local_to_gpt2]
 
         """实例化 WikiHMM 模块: self.wiki_hmm"""
         self.wiki_hmm = WikiHMM(self.cluster_num, configs.colsum_threshold)
@@ -391,11 +386,15 @@ class Model(nn.Module):
         """实例化 Normalize 模块: self.normalize_layers"""
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
 
+        if self.topkmode == 'all':
+            self.topk_projection = nn.Linear(max_local_id + 1, self.topk)
+            self.embedding_bias = nn.Parameter(torch.randn(self.cluster_num, self.d_llm))
+
         """实例化 Patching 模块: self.patching"""
         self.patching = Patching(self.patch_len, self.stride)
 
         """在输入TransformerEncoder前, 需要先将它投影到d_model"""
-        self.patch_projection = nn.Linear(patch_len, self.d_model)
+        self.patch_projection = nn.Linear(self.patch_len, self.d_model)
 
         """实例化 TSCluster 模块: self.ts_cluster"""
         bkb_kargs = {'encoder_layer': nn.TransformerEncoderLayer(d_model=configs.d_model, nhead=configs.n_heads),
@@ -413,20 +412,20 @@ class Model(nn.Module):
         self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout)
         
         
-    def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
+    def forward(self, x_enc=None, text_input=None, epoch_init_logits=None, epoch_transition_logits=None, epoch_emission_logits=None,is_pretrain=False):   
         if is_pretrain:
-            _, _, _, hmm_loss= self.wiki_hmm(text_input)
-            return hmm_loss
+            _, _, _, likelihood_loss, transition_entropy_loss, cnct_const = self.wiki_hmm(text_input)
+            return likelihood_loss, transition_entropy_loss, cnct_const
         else:
-            dec_out, hmm_loss, entropy_loss = self.forecast(x_enc, text_input)
-            return dec_out[:, -self.pred_len:, :], hmm_loss, entropy_loss
+            dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = self.forecast(x_enc, text_input, epoch_init_logits, epoch_transition_logits, epoch_emission_logits)
+            return dec_out[:, -self.pred_len:, :], likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
     
         
-    def forecast(self, x_enc, text_input=None):
+    def forecast(self, x_enc, text_input=None, epoch_init_logits=None, epoch_transition_logits=None, epoch_emission_logits=None):
         # 训练时
         if text_input is not None:
             """调用 wiki_hmm 模块: self.wiki_hmm"""
-            text_pi, text_A, text_B, hmm_loss = self.wiki_hmm(text_input)
+            text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const = self.wiki_hmm(text_input)
 
             """原始输入 x_enc: [bs, seq_len, n_vars]"""
 
@@ -444,12 +443,14 @@ class Model(nn.Module):
             """调用 TSCluster 模块: self.ts_cluster"""
             cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, text_pi, text_A)  # [bs*n_vars, patch_num, cluster_num]
 
-            """获取word embedding"""
-            _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1) # [n_cluster, topk]
-            # 直接用tensor索引映射到gpt2_id
-            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
-            topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
-
+            """获取topk token embedding for all clusters"""
+            if self.topkmode == 'select':
+                _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1) # [n_cluster, topk]
+                # 直接用tensor索引映射到gpt2_id
+                topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
+                topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
+            elif self.topkmode == 'all':
+                topk_token_embeddings = self.topk_projection(self.local_word_embeddings.T).T + self.embedding_bias[:,None,:] # [n_cluster, topk, d_llm]
             """调用 TSAligner 模块: self.ts_aligner"""
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs)  # [bs*n_vars, patch_num, d_llm]
             
@@ -467,11 +468,11 @@ class Model(nn.Module):
 
             dec_out = dec_out.permute(0, 2, 1).contiguous()  # [bs, pred_len, n_vars]
             dec_out = self.normalize_layers(dec_out, 'denorm')
-            return dec_out, hmm_loss, entropy_loss
+            return dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
         else:
-            text_pi = F.softmax(self.epoch_init_logits.to(self.device), dim=0)
-            text_A = F.softmax(self.epoch_transition_logits.to(self.device), dim =1)
-            text_B = F.softmax(self.epoch_emission_logits.to(self.device), dim=1)
+            text_pi = F.softmax(epoch_init_logits, dim=0)
+            text_A = F.softmax(epoch_transition_logits, dim =1)
+            text_B = F.softmax(epoch_emission_logits, dim=1)
             hmm_loss = 0
 
             _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1)

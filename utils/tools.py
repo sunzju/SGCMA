@@ -14,11 +14,12 @@ plt.switch_backend('agg')
 class WikiDataset(Dataset):
     def __init__(self, sentences_path): 
         self.sentences_path = sentences_path
-        self.f = h5py.File(self.sentences_path, 'r')
-        self.len = len(self.f['sentences'])
+        f = h5py.File(self.sentences_path, 'r')
+        self.len = len(f['sentences'])
     def __getitem__(self, idx):
-        sentence = self.f['sentences'][idx]        # 一个样本
-        return torch.tensor(sentence, dtype=torch.int32)    
+        with h5py.File(self.sentences_path, 'r') as f:
+            sentence = f['sentences'][idx]        # 一个样本
+            return torch.tensor(sentence, dtype=torch.int32)    
     def __len__(self):
         return self.len
 
@@ -147,22 +148,26 @@ def vali(args, model, vali_data, vali_loader, criterion, mae_metric):
     init_logits_path = os.path.join('pretrain_model/vali', 'epoch_init_logits.pt')
     transition_logits_path = os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt')
     emission_logits_path = os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt')
-    model.epoch_init_logits = torch.load(init_logits_path).to(device)
-    model.epoch_transition_logits = torch.load(transition_logits_path).to(device)
-    model.epoch_emission_logits = torch.load(emission_logits_path).to(device)
+    epoch_init_logits = torch.load(init_logits_path).to(device)
+    epoch_transition_logits = torch.load(transition_logits_path).to(device)
+    epoch_emission_logits = torch.load(emission_logits_path).to(device)
 
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
+        for i, (batch_x, batch_y, _, _) in tqdm(enumerate(vali_loader)):
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
-            batch_x_mark = batch_x_mark.float().to(device)
-            batch_y_mark = batch_y_mark.float().to(device)
+            # batch_x_mark = batch_x_mark.float().to(device)
+            # batch_y_mark = batch_y_mark.float().to(device)
 
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(device)
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
 
-            outputs, _ , _= model(batch_x)
+            outputs, _ , _= model(batch_x, 
+                                  text_input=None, 
+                                  epoch_init_logits=epoch_init_logits, 
+                                  epoch_transition_logits=epoch_transition_logits, 
+                                  epoch_emission_logits=epoch_emission_logits)
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]

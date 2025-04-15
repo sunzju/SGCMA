@@ -1,6 +1,5 @@
 import torchvision
 torchvision.disable_beta_transforms_warning()
-
 import argparse
 import torch
 from torch import nn, optim
@@ -10,13 +9,35 @@ import time
 import random
 import numpy as np
 import os
-
-
+import logging
 from models import SGCMA
 from data_provider.data_factory import data_provider
 from utils.tools import text_data_provider, remap_tokens_to_local_vocab, del_files, EarlyStopping, adjust_learning_rate, vali
-
+import seaborn as sns
+import matplotlib.pyplot as plt
 # change something
+
+def makeup_logging(logging_file_nm):
+    # # 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
+    log_dir = "log"  
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, logging_file_nm)  
+    # 自定义 Logger
+    logger = logging.getLogger('SGCMA_Training')
+    logger.setLevel(logging.DEBUG)  # 设置全局最低级别为 DEBUG
+    # 日志格式
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    # 文件 Handler：输出 DEBUG 及以上到文件
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)  # 文件记录 DEBUG 及以上
+    file_handler.setFormatter(formatter)
+    # 控制台 Handler：仅输出 INFO 及以上
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)  
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
 
 """环境变量"""
 os.environ['CURL_CA_BUNDLE'] = ''  # 禁用 SSL 证书验证
@@ -35,6 +56,7 @@ def parse_args():
     parser.add_argument('--model', type=str, default='Mymodel',
                         help='model name, options: [Autoformer, DLinear, Mymodel]')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
+    parser.add_argument('--device', type=str, default='cuda:0', help='device')
 
     # wikihmm
     parser.add_argument('--sentences_path', type=str, default='wikidata/sentences_35.h5', help='wiki_sentences file')
@@ -82,9 +104,14 @@ def parse_args():
     parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
+    parser.add_argument('--cluster_num', type=int, default=128, help='cluster number')
+    parser.add_argument('--topk', type=int, default=32, help='topk')
+    parser.add_argument('--topkmode', type=str, default='select', help='select or all')
+    parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
+    parser.add_argument('--hmm_pretrained_flag', type=int, default=0, help='is pretrain')
 
     # optimization
-    parser.add_argument('--num_workers', type=int, default=32, help='data loader num workers')
+    parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
     parser.add_argument('--pretrain_epochs', type=int, default=6, help='pretrain hmm epochs')
@@ -112,7 +139,7 @@ def main():
     # 解析参数
     args = parse_args()
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # 加载映射字典
@@ -125,10 +152,12 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_df{}_fc{}_eb{}_{}_{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_df{}_fc{}_eb{}_cn{}_tk{}_tkm{}_{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
             args.seq_len, args.label_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.factor, args.embed, args.des, ii)
+            args.e_layers, args.d_ff, args.factor, args.embed, args.cluster_num, args.topk, args.topkmode, ii)
+        print(setting)
+        logger = makeup_logging(setting)
 
         # 加载 ts dataset 和 ts dataloader
         train_data, train_loader = data_provider(args, 'train')
@@ -139,9 +168,9 @@ def main():
         model = SGCMA.Model(args).float().to(device)
 
         # 检查点路径
-        path = os.path.join(args.checkpoints, setting + '-' + args.model_comment)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        check_pth = os.path.join(args.checkpoints, setting + '-' + args.model_comment)
+        if not os.path.exists(check_pth):
+            os.makedirs(check_pth)
 
         early_stopping = EarlyStopping(patience=args.patience)
 
@@ -153,78 +182,90 @@ def main():
         criterion = nn.MSELoss()
         mae_metric = nn.L1Loss()
         
-        pretrain_hmm_path = os.path.join(args.pretrain_hmm_path, 'text_hmm.pth')
-        if os.path.exists(pretrain_hmm_path):
-            print(f"Pretrained HMM found at {pretrain_hmm_path}. Skipping Phase 1.")
-            model.load_state_dict(torch.load(pretrain_hmm_path), strict=False)
-
+        
+        if args.hmm_pretrained_flag:
+            pretrain_hmm_path = os.path.join(args.pretrain_hmm_path, 'hmm_checkpoint.pth')
+            if os.path.exists(pretrain_hmm_path):
+                print(f"Pretrained HMM found at {pretrain_hmm_path}. Skipping Phase 1.")
+                full_model_state = torch.load(pretrain_hmm_path, map_location=device)
+                model.wiki_hmm.load_state_dict(full_model_state)
+            else:
+                print("No pretrained HMM found. Starting Phase 1 from scratch.")
         else:
-            checkpoint_path = os.path.join(args.pretrain_hmm_path, 'checkpoint.pth')
-            start_epoch = 0
+            checkpoint_path = os.path.join(check_pth, 'checkpoint')
             if os.path.exists(checkpoint_path):
                 print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
-                checkpoint = torch.load(checkpoint_path)
-                model.load_state_dict(checkpoint['model_state_dict'])  # 加载模型状态
-                model_optim.load_state_dict(checkpoint['optimizer_state_dict'])  # 加载优化器状态
-                start_epoch = checkpoint['epoch'] + 1  # 从下一个 epoch 开始
-                print(f"Resuming from epoch {start_epoch}")
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                model.load_state_dict(checkpoint)  # 加载模型状态
+                print(f"Loaded from {checkpoint_path}")
             else:
                 print("No checkpoint found. Starting Phase 1 from scratch.")        
             # === Phase 1: Train text HMM for 5 epochs ===
             print("Starting Phase 1: Training text HMM for 5 epochs")
-            text_dataset, text_dataloader = text_data_provider(args)
+            _, text_dataloader = text_data_provider(args)
             model.train()
-            for epoch in range(start_epoch, args.pretrain_epochs):  
+            for epoch in range(args.pretrain_epochs):  
                 epoch_time = time.time()
                 epoch_loss = 0.0
-                with tqdm(text_dataloader, desc=f"Text Epoch {epoch + 1}") as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
-                    for batch_idx, sentences in enumerate(pbar):
+                iter_text_dataloader = iter(text_dataloader)
+                with tqdm(range(2000), desc=f"Text Epoch {epoch + 1}") as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
+                    for batch_idx in pbar:
+                        sentences = next(iter_text_dataloader)
                         sentences = sentences.to(device)
                         sentences_mapped = remap_tokens_to_local_vocab(sentences, gpt2_to_local) 
                         model_optim.zero_grad()
-                        hmm_loss = model(text_input = sentences_mapped, is_pretrain=True)  # is_pretrain=True，则hmm_loss= self.wiki_hmm(text_input)                    
+                        likelihood_loss, transition_entropy_loss, cnct_const = model(text_input=sentences_mapped, is_pretrain=True)  # is_pretrain=True，则hmm_loss= self.wiki_hmm(text_input)                    
+                        hmm_loss = likelihood_loss
                         hmm_loss.backward()
                         model_optim.step()
                         epoch_loss += hmm_loss.item()
-                        pbar.set_postfix({'loss': hmm_loss.item()})
-                avg_train_loss = epoch_loss/len(text_dataloader)
+                        pbar.set_postfix({'loss': epoch_loss / (batch_idx + 1)})
+                
+                avg_train_loss = epoch_loss / 2000
+
+
+                # 加载状态转移矩阵
+                transition_logits = model.wiki_hmm.transition_logits.detach().cpu()
+                transition_matrix = torch.softmax(transition_logits, dim=1).numpy()  # 转换为概率矩阵
+
+                # 绘制状态转移矩阵热力图
+                plt.figure(figsize=(12, 10))
+                sns.heatmap(transition_matrix, cmap='Reds', linewidths=0.1, linecolor='white',annot=False, fmt=".2f", 
+                            xticklabels=False, yticklabels=False, cbar=True)
+                plt.title("State Transition Matrix")
+                plt.xlabel("Next State")
+                plt.ylabel("Current State")
+                plt.savefig(os.path.join(check_pth, f'transition_matrix_heatmap_{epoch + 1}.png'), bbox_inches="tight")
+                plt.close()
                 print(f"Text Epoch {epoch + 1} cost time: {time.time() - epoch_time}")
                 print(f"Text Epoch {epoch + 1} Average Loss: {avg_train_loss:.7f}")
 
                 # 保存当前epoch的模型和状态
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': model_optim.state_dict(),
-                }
-                torch.save(checkpoint, checkpoint_path)
-                print(f"Saved checkpoint for epoch {epoch + 1} at {checkpoint_path}")
-            # 保存预训练模型
-            torch.save(model.state_dict(), os.path.join(args.pretrain_hmm_path, 'text_hmm.pth'))
-            torch.save(model.wiki_hmm.init_logits, os.path.join(args.pretrain_hmm_path, 'init_logits.pt'))
-            torch.save(model.wiki_hmm.transition_logits, os.path.join(args.pretrain_hmm_path, 'transition_logits.pt'))
-            torch.save(model.wiki_hmm.emission_logits, os.path.join(args.pretrain_hmm_path, 'emission_logits.pt'))
-            print("Saved text HMM model")
+            hmm_checkpoint = model.wiki_hmm.state_dict()
+            torch.save(hmm_checkpoint, os.path.join(check_pth, f'hmm_checkpoint.pth'))
+            print(f"Saved checkpoint for hmm pretraining")
+
+
 
         # === Phase 2: Joint training ===
         print("Starting Phase 2: Joint training")
         for epoch in range(args.train_epochs):  
+            if early_stopping.early_stop:
+                break
             model.train()
             train_loss = 0.0         # 总损失
             train_hmm_loss = 0.0     # text的极大似然损失
             train_entropy_loss = 0.0 # ts聚类的熵损失            
             train_mseloss = 0.0      # ts的mse损失
-
             epoch_time = time.time()
             model_optim.zero_grad()
-
-            # 动态下采样 text dataloader，以保持和ts相同的迭代次数
-            _, text_dataloader = text_data_provider(args, ts_iter_count = len(train_loader))
             # zip 将两个 DataLoader 的迭代器配对，同步迭代.  对于zip两个Dataloader同步迭代，使用tqdm包装，total总长度需要显式地写出来。单个DataLoader时不需要
             pbar = tqdm(range(len(train_loader)), desc=f"Train Epoch {epoch + 1}", total=len(train_loader))
             iter_train_loader = iter(train_loader)
             iter_text_dataloader = iter(text_dataloader)
+
             for batch_idx in pbar:
+
                 ts_batch = next(iter_train_loader)
                 text_batch = next(iter_text_dataloader)
                 batch_x, batch_y, _, _ = ts_batch
@@ -234,7 +275,7 @@ def main():
                 
                 text_mapped = remap_tokens_to_local_vocab(text_batch, gpt2_to_local)
 
-                outputs, hmm_loss, entropy_loss = model(
+                outputs, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = model(
                     batch_x, text_input=text_mapped, is_pretrain=False
                 )  # 但其实只用到了batch_x，其他都没用
 
@@ -245,13 +286,19 @@ def main():
                 mseloss = criterion(outputs, batch_y)
 
                 # total_loss = mseloss + hmm_loss + entropy_loss
-                total_loss = mseloss
+                loss = 0
+                if 'mse' in args.loss_mode:
+                    loss += mseloss
+                if 'hmm' in args.loss_mode:
+                    loss += likelihood_loss
+                if 'entropy' in args.loss_mode:
+                    loss += entropy_loss
 
                 model_optim.zero_grad()
-                total_loss.backward()
+                loss.backward()
                 model_optim.step()
 
-                train_loss += total_loss.cpu().detach().item()
+                train_loss += loss.cpu().detach().item()
                 train_hmm_loss += hmm_loss.cpu().detach().item()
                 train_mseloss += mseloss.cpu().detach().item()
                 train_entropy_loss += entropy_loss.cpu().detach().item()
@@ -265,30 +312,33 @@ def main():
                     'hmm_loss': train_hmm_loss / (batch_idx + 1)
                 })
 
+                if batch_idx % 200 == 199:
+                    torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
+                    torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
+                    torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
+                    vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
+                    test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
+                    print('')
+                    print(f"Epoch {epoch + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
+                  f"MAE Loss: {test_mae_loss:.7f}", end='\r')
+                    logger.info(f"Epoch {epoch + 1}/{batch_idx + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
+                  f"MAE Loss: {test_mae_loss:.7f}")
+                    early_stopping(vali_mseloss, model, check_pth)
+                    if early_stopping.early_stop:
+                        print("Early stopping")
+                        logger.info("Early stopping")
+                        break
+
                 # print(f"mse: {train_mseloss / (batch_idx + 1)}, entropy_loss: {train_entropy_loss / (batch_idx + 1)}, hmm_loss: {train_hmm_loss / (batch_idx + 1)}", end='\r')
-            torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
-            torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
-            torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
-            print("Save epoch_logits")
+           
 
             print(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
                   f"HMM Loss: {train_hmm_loss / len(train_loader):.7f} | "
                   f"MSE Loss: {train_mseloss / len(train_loader):.7f} | "
                   f"Entropy Loss: {train_entropy_loss / len(train_loader):.7f} ")
 
-            # 验证和早停
-            vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
-            test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
-            print(f"Epoch {epoch + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
-                  f"MAE Loss: {test_mae_loss:.7f}")
 
-            early_stopping(vali_mseloss, model, path)
-            if early_stopping.early_stop:
-                print("Early stopping")
-                break
-
-        del_files(path)
-        print('Deleted checkpoints successfully')
 
 if __name__ == '__main__':
+    
     main()
