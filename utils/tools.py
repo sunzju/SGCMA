@@ -14,23 +14,21 @@ plt.switch_backend('agg')
 class WikiDataset(Dataset):
     def __init__(self, sentences_path): 
         self.sentences_path = sentences_path
+        self.f = h5py.File(self.sentences_path, 'r')
+        self.len = len(self.f['sentences'])
     def __getitem__(self, idx):
-        with h5py.File(self.sentences_path, 'r') as f:
-            sentence = f['sentences'][idx]        # 一个样本
+        sentence = self.f['sentences'][idx]        # 一个样本
         return torch.tensor(sentence, dtype=torch.int32)    
     def __len__(self):
-        with h5py.File(self.sentences_path, 'r') as f:
-            total_len = len(f['sentences'])
-        return total_len
+        return self.len
 
 class EpochRandomSampler(Sampler):
     def __init__(self, total_len, max_samples):
         self.total_len = total_len
         self.max_samples = max_samples
     def __iter__(self):
-        indices = random.sample(range(self.total_len), self.max_samples)
-        random.shuffle(indices)
-        return iter(indices)
+        indices = torch.randperm(self.total_len)[:self.max_samples]
+        return iter(indices.tolist())
     def __len__(self):
         return self.max_samples
 
@@ -38,13 +36,14 @@ def text_data_provider(args, ts_iter_count=None):
     max_samples = ts_iter_count * args.text_batch_size if ts_iter_count is not None else None
     text_dataset = WikiDataset(sentences_path=args.sentences_path)
     total_len = len(text_dataset)
-    text_sampler = EpochRandomSampler(total_len, max_samples)
+    # text_sampler = EpochRandomSampler(total_len, max_samples)
     text_dataloader = DataLoader(
         text_dataset,
         batch_size = args.text_batch_size,
-        sampler = text_sampler,
+        # sampler = text_sampler,
         num_workers=4, 
-        pin_memory=True)
+        pin_memory=True
+    )
     return text_dataset, text_dataloader
     
 
@@ -85,7 +84,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         self.delta = delta
         self.save_mode = save_mode
 
@@ -145,9 +144,9 @@ def vali(args, model, vali_data, vali_loader, criterion, mae_metric):
     total_mae_loss = []
 
     # 加载保存的 emission_logits
-    init_logits_path = os.path.join(r'exp2\pretrain_model\vali', 'epoch_init_logits.pt')
-    transition_logits_path = os.path.join(r'exp2\pretrain_model\vali', 'epoch_transition_logits.pt')
-    emission_logits_path = os.path.join(r'exp2\pretrain_model\vali', 'epoch_emission_logits.pt')
+    init_logits_path = os.path.join('pretrain_model/vali', 'epoch_init_logits.pt')
+    transition_logits_path = os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt')
+    emission_logits_path = os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt')
     model.epoch_init_logits = torch.load(init_logits_path).to(device)
     model.epoch_transition_logits = torch.load(transition_logits_path).to(device)
     model.epoch_emission_logits = torch.load(emission_logits_path).to(device)
@@ -163,7 +162,7 @@ def vali(args, model, vali_data, vali_loader, criterion, mae_metric):
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(device)
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
 
-            outputs, _ , _= model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            outputs, _ , _= model(batch_x)
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]

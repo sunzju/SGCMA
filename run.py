@@ -37,16 +37,16 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
 
     # wikihmm
-    parser.add_argument('--sentences_path', type=str, default='exp2\wikidata\sentences_35.h5', help='wiki_sentences file')
-    parser.add_argument('--unique_tokens_path', type=str, default='exp2\wikidata\tokens_35.pkl', help='unique tokens file')
-    parser.add_argument('--pretrain_hmm_path', type=str, default='exp2\pretrain_model', help='save_pretrain_hmm_path')
+    parser.add_argument('--sentences_path', type=str, default='wikidata/sentences_35.h5', help='wiki_sentences file')
+    parser.add_argument('--unique_tokens_path', type=str, default='wikidata/tokens_35.pkl', help='unique tokens file')
+    parser.add_argument('--pretrain_hmm_path', type=str, default='wikidata', help='save_pretrain_hmm_path')
     parser.add_argument('--hidden_state_num', type=int, default=100, help='hmm hidden_state_num')
     parser.add_argument('--colsum_threshold', type=float, default=0.2, help='hidden_state arrived lower bound logits')
     parser.add_argument('--text_batch_size', type=int, default=1024, help='batch size of wikipedia data')
 
     # ts data loader
     parser.add_argument('--data', type=str, default='ETTh1', help='datasets type')
-    parser.add_argument('--root_path', type=str, default='exp2\datasets\ETT-small', help='root path of the data file')
+    parser.add_argument('--root_path', type=str, default='dataset/ETT-small', help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; '
@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument('--freq', type=str, default='h',
                         help='freq for time features encoding, '
                              'options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly]')
-    parser.add_argument('--checkpoints', type=str, default='exp2\checkpoints', help='location of model checkpoints')
+    parser.add_argument('--checkpoints', type=str, default='checkpoints', help='location of model checkpoints')
 
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
 
     # optimization
-    parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
+    parser.add_argument('--num_workers', type=int, default=32, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
     parser.add_argument('--pretrain_epochs', type=int, default=6, help='pretrain hmm epochs')
@@ -116,7 +116,7 @@ def main():
     print(f"Using device: {device}")
 
     # 加载映射字典
-    gpt2_to_local_id = torch.load(r'exp2\utils\gpt2_to_local_id.pt')
+    gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
     vocab_size = 50256
     gpt2_to_local = torch.full((vocab_size,), -1, dtype=torch.int32)
     for gpt2_id, local_id in gpt2_to_local_id.items():
@@ -156,7 +156,7 @@ def main():
         pretrain_hmm_path = os.path.join(args.pretrain_hmm_path, 'text_hmm.pth')
         if os.path.exists(pretrain_hmm_path):
             print(f"Pretrained HMM found at {pretrain_hmm_path}. Skipping Phase 1.")
-            model.load_state_dict(torch.load(pretrain_hmm_path))
+            model.load_state_dict(torch.load(pretrain_hmm_path), strict=False)
 
         else:
             checkpoint_path = os.path.join(args.pretrain_hmm_path, 'checkpoint.pth')
@@ -219,50 +219,56 @@ def main():
             model_optim.zero_grad()
 
             # 动态下采样 text dataloader，以保持和ts相同的迭代次数
-            text_dataset, text_dataloader = text_data_provider(args, ts_iter_count = len(train_loader))
+            _, text_dataloader = text_data_provider(args, ts_iter_count = len(train_loader))
             # zip 将两个 DataLoader 的迭代器配对，同步迭代.  对于zip两个Dataloader同步迭代，使用tqdm包装，total总长度需要显式地写出来。单个DataLoader时不需要
-            with tqdm(zip(train_loader, text_dataloader), desc=f"Train Epoch {epoch + 1}", total=len(train_loader)) as pbar:
-                for batch_idx, (ts_batch, text_batch) in enumerate(pbar):
-                    batch_x, batch_y, batch_x_mark, batch_y_mark = ts_batch
-                    batch_x = batch_x.float().to(device)
-                    batch_y = batch_y.float().to(device)
-                    batch_x_mark = batch_x_mark.float().to(device)
-                    batch_y_mark = batch_y_mark.float().to(device)
-                    text_batch = text_batch.to(device)
-                    
-                    text_mapped = remap_tokens_to_local_vocab(text_batch, gpt2_to_local)
+            pbar = tqdm(range(len(train_loader)), desc=f"Train Epoch {epoch + 1}", total=len(train_loader))
+            iter_train_loader = iter(train_loader)
+            iter_text_dataloader = iter(text_dataloader)
+            for batch_idx in pbar:
+                ts_batch = next(iter_train_loader)
+                text_batch = next(iter_text_dataloader)
+                batch_x, batch_y, _, _ = ts_batch
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
+                text_batch = text_batch.to(device)
+                
+                text_mapped = remap_tokens_to_local_vocab(text_batch, gpt2_to_local)
 
-                    dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(device)
-                    dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
+                outputs, hmm_loss, entropy_loss = model(
+                    batch_x, text_input=text_mapped, is_pretrain=False
+                )  # 但其实只用到了batch_x，其他都没用
 
-                    outputs, hmm_loss, entropy_loss = model(
-                        batch_x, batch_x_mark, dec_inp, batch_y_mark, text_input=text_mapped, is_pretrain=False
-                    )  # 但其实只用到了batch_x，其他都没用
 
-                    f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                    mseloss = criterion(outputs, batch_y)
+                f_dim = -1 if args.features == 'MS' else 0
+                outputs = outputs[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:]
+                mseloss = criterion(outputs, batch_y)
 
-                    total_loss = mseloss + hmm_loss + entropy_loss
+                # total_loss = mseloss + hmm_loss + entropy_loss
+                total_loss = mseloss
 
-                    model_optim.zero_grad()
-                    total_loss.backward()
-                    model_optim.step()
+                model_optim.zero_grad()
+                total_loss.backward()
+                model_optim.step()
 
-                    train_loss += total_loss.item()
-                    train_hmm_loss += hmm_loss.item()
-                    train_mseloss += mseloss.item()
-                    train_entropy_loss += entropy_loss.item()
+                train_loss += total_loss.cpu().detach().item()
+                train_hmm_loss += hmm_loss.cpu().detach().item()
+                train_mseloss += mseloss.cpu().detach().item()
+                train_entropy_loss += entropy_loss.cpu().detach().item()
+                
+                torch.cuda.empty_cache()
 
-                    pbar.set_postfix({
-                        'mse': train_mseloss / (batch_idx + 1),  
-                        'entropy_loss': train_entropy_loss / (batch_idx + 1),                     
-                        'hmm_loss': train_hmm_loss / (batch_idx + 1)
-                    })
-            torch.save(model.wiki_hmm.init_logits, os.path.join(r'exp2\pretrain_model\vali', 'epoch_init_logits.pt'))
-            torch.save(model.wiki_hmm.transition_logits, os.path.join(r'exp2\pretrain_model\vali', 'epoch_transition_logits.pt'))
-            torch.save(model.wiki_hmm.emission_logits, os.path.join(r'exp2\pretrain_model\vali', 'epoch_emission_logits.pt'))
+
+                pbar.set_postfix({
+                    'mse': train_mseloss / (batch_idx + 1),  
+                    'entropy_loss': train_entropy_loss / (batch_idx + 1),                     
+                    'hmm_loss': train_hmm_loss / (batch_idx + 1)
+                })
+
+                # print(f"mse: {train_mseloss / (batch_idx + 1)}, entropy_loss: {train_entropy_loss / (batch_idx + 1)}, hmm_loss: {train_hmm_loss / (batch_idx + 1)}", end='\r')
+            torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
+            torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
+            torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
             print("Save epoch_logits")
 
             print(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
