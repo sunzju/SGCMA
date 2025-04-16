@@ -53,8 +53,8 @@ def parse_args():
     parser.add_argument('--is_training', type=int, default=1, help='status')
     parser.add_argument('--model_id', type=str, default='test', help='model id')
     parser.add_argument('--model_comment', type=str, default='none', help='prefix when saving test results')
-    parser.add_argument('--model', type=str, default='Mymodel',
-                        help='model name, options: [Autoformer, DLinear, Mymodel]')
+    parser.add_argument('--model', type=str, default='SGCMA',
+                        help='model name')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
 
@@ -104,7 +104,7 @@ def parse_args():
     parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
-    parser.add_argument('--cluster_num', type=int, default=16, help='cluster number')
+    parser.add_argument('--cluster_num', type=int, default=32, help='cluster number')
     parser.add_argument('--topk', type=int, default=512, help='topk')
     parser.add_argument('--topkmode', type=str, default='select', help='select or all')
     parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
@@ -115,7 +115,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
-    parser.add_argument('--pretrain_epochs', type=int, default=3, help='pretrain hmm epochs')
+    parser.add_argument('--pretrain_epochs', type=int, default=6, help='pretrain hmm epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='batch size of model evaluation')
     parser.add_argument('--eval_interval_iters', type=int, default=200, help='max epochs')
