@@ -1,3 +1,4 @@
 datasets/
 checkpoints/
 gpt2/
+log/
