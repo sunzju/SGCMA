@@ -44,7 +44,7 @@ def text_data_provider(args, ts_iter_count=None):
         text_dataset,
         batch_size = args.text_batch_size,
         # sampler = text_sampler,
-        num_workers=4, 
+        num_workers=args.num_workers, 
         pin_memory=True
     )
     return text_dataset, text_dataloader

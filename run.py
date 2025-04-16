@@ -104,21 +104,22 @@ def parse_args():
     parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
-    parser.add_argument('--cluster_num', type=int, default=128, help='cluster number')
-    parser.add_argument('--topk', type=int, default=32, help='topk')
+    parser.add_argument('--cluster_num', type=int, default=16, help='cluster number')
+    parser.add_argument('--topk', type=int, default=512, help='topk')
     parser.add_argument('--topkmode', type=str, default='select', help='select or all')
     parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
-    parser.add_argument('--hmm_pretrained_flag', type=int, default=1, help='is pretrain')
+    parser.add_argument('--hmm_pretrained_flag', type=int, default=0, help='is pretrain')
     parser.add_argument('--load_hmm_flag', type=int, default=1, help='is load hmm')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
-    parser.add_argument('--pretrain_epochs', type=int, default=6, help='pretrain hmm epochs')
+    parser.add_argument('--pretrain_epochs', type=int, default=3, help='pretrain hmm epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='batch size of model evaluation')
-    parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
+    parser.add_argument('--eval_interval_iters', type=int, default=200, help='max epochs')
+    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=1e-3, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
@@ -160,7 +161,7 @@ def main():
         logger = makeup_logging(setting)
 
         # 加载 ts dataset 和 ts dataloader
-        train_data, train_loader = data_provider(args, 'train')
+        train_data, train_loader = data_provider(args, 'train') 
         vali_data, vali_loader = data_provider(args, 'val')
         test_data, test_loader = data_provider(args, 'test')
 
@@ -194,7 +195,7 @@ def main():
         _, text_dataloader = text_data_provider(args)
 
         if args.load_hmm_flag:
-            pretrain_hmm_path = os.path.join(check_pth, 'hmm_checkpoint.pth')
+            pretrain_hmm_path = os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_checkpoint.pth')
             if os.path.exists(pretrain_hmm_path):
                 print(f"Pretrained HMM found at {pretrain_hmm_path}.")
                 full_model_state = torch.load(pretrain_hmm_path, map_location=device)
@@ -203,7 +204,6 @@ def main():
         if not args.hmm_pretrained_flag:
             # === Phase 1: Train text HMM for 5 epochs ===
             print("Starting Phase 1: Training text HMM for 5 epochs")
-
             model.train()
             for epoch in range(args.pretrain_epochs):  
                 epoch_time = time.time()
@@ -235,20 +235,15 @@ def main():
                                 plt.ylabel("Current State")
                                 plt.savefig(os.path.join(check_pth, f'transition_matrix_heatmap_{epoch + 1}-{batch_idx}.png'), bbox_inches="tight")
                                 plt.close()
+                                hmm_checkpoint = model.wiki_hmm.state_dict()
+                                torch.save(hmm_checkpoint, os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_checkpoint.pth'))
+                                print(f"Saved checkpoint for hmm pretraining")
 
-                
                 avg_train_loss = epoch_loss / len(text_dataloader)
                 logger.info(f"Text Epoch {epoch + 1} cost time: {time.time() - epoch_time}")
                 logger.info(f"Text Epoch {epoch + 1} Average Loss: {avg_train_loss:.7f}")
 
-
-
-
                 # 保存当前epoch的模型和状态
-                hmm_checkpoint = model.wiki_hmm.state_dict()
-                torch.save(hmm_checkpoint, os.path.join(check_pth, f'hmm_checkpoint.pth'))
-                print(f"Saved checkpoint for hmm pretraining")
-
 
 
         # === Phase 2: Joint training ===
@@ -283,7 +278,6 @@ def main():
                     batch_x, text_input=text_mapped, is_pretrain=False
                 )  # 但其实只用到了batch_x，其他都没用
 
-
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -args.pred_len:, f_dim:]
@@ -309,27 +303,23 @@ def main():
                 
                 torch.cuda.empty_cache()
 
-
                 pbar.set_postfix({
                     'mse': train_mseloss / (batch_idx + 1),  
                     'entropy_loss': train_entropy_loss / (batch_idx + 1),                     
                     'hmm_loss': train_hmm_loss / (batch_idx + 1)
                 })
 
-                if batch_idx % 200 == 199:
+                if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1:
                     # torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
                     # torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
                     # torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
                     vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
                     test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
                     print('')
-                    print(f"Epoch {epoch + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
-                  f"MAE Loss: {test_mae_loss:.7f}", end='\r')
                     logger.info(f"Epoch {epoch + 1}/{batch_idx + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
                   f"MAE Loss: {test_mae_loss:.7f}")
                     early_stopping(vali_mseloss, model, check_pth)
                     if early_stopping.early_stop:
-                        print("Early stopping")
                         logger.info("Early stopping")
                         break
 
