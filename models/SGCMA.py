@@ -404,7 +404,7 @@ class Model(nn.Module):
         self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=configs.dropout, temperature=configs.temperature)
 
         """用在GPT2最后一个隐藏层输出, 先进行一步降维到d_ff=32"""
-        self.projection = nn.Linear(self.d_llm, self.d_ff)
+        self.projection = nn.Linear(self.d_llm + self.d_model, self.d_ff)
 
         """实例化 FlattenHead 模块: self.output_projection"""
         self.head_nf = self.d_ff * self.patch_num
@@ -456,7 +456,7 @@ class Model(nn.Module):
             """ 输入 LLM """
             dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  # [bs*n_vars, patch_num, d_llm]
             """调用 self.projection, 将GPT2隐藏层输出先进行一次降维"""
-            dec_out = self.projection(dec_out)  # [bs*n_vars, patch_num, d_ff]
+            dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  # [bs*n_vars, patch_num, d_ff]
 
             # 重塑形状
             dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
@@ -485,7 +485,7 @@ class Model(nn.Module):
             cluster_probs, ts_embedding, ts_pi, ts_A, entropy_loss = self.ts_cluster(enc_out,text_pi,text_A)
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs) 
             dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  
-            dec_out = self.projection(dec_out)  
+            dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  
             dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
             dec_out = dec_out.permute(0, 1, 3, 2).contiguous() 
             dec_out = self.output_projection(dec_out)  

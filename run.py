@@ -190,12 +190,16 @@ def main():
 
         checkpoint_path = os.path.join(check_pth, 'checkpoint')
         if os.path.exists(checkpoint_path):
-            print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint)  # 加载模型状态
-            print(f"Loaded from {checkpoint_path}")
+            try:
+                print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                model.load_state_dict(checkpoint, strict=False)  # 加载模型状态
+                print(f"Loaded from {checkpoint_path}")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                print("No checkpoint found. Starting Phase 1 from scratch.")    
         else:
-            print("No checkpoint found. Starting Phase 1 from scratch.")        
+            print("No checkpoint found. Starting from scratch.")        
 
         _, text_dataloader = text_data_provider(args)
 
@@ -253,6 +257,8 @@ def main():
 
         # === Phase 2: Joint training ===
         print("Starting Phase 2: Joint training")
+        best_test_mse = float('inf')
+        best_vali_mse = float('inf')
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
                 break
@@ -321,8 +327,12 @@ def main():
                     vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
                     test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
                     print('')
-                    logger.info(f"Epoch {epoch + 1}/{batch_idx + 1} | Vali MSE Loss: {vali_mseloss:.7f} | Test MSE Loss: {test_mseloss:.7f} | "
-                  f"MAE Loss: {test_mae_loss:.7f}")
+                    if vali_mseloss < best_vali_mse:
+                        best_vali_mse = vali_mseloss
+                    if test_mseloss < best_test_mse:
+                        best_test_mse = test_mseloss
+                    logger.info(f"Epoch {epoch + 1}/{batch_idx + 1} | V MSE Loss: {vali_mseloss:.7f} | T MSE Loss: {test_mseloss:.7f} | "
+                  f"T MAE Loss: {test_mae_loss:.7f} | Best V MSE: {best_vali_mse:.7f} | Best T MSE: {best_test_mse:.7f}")
                     early_stopping(vali_mseloss, model, check_pth)
                     if early_stopping.early_stop:
                         logger.info("Early stopping")
