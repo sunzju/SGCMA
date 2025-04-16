@@ -91,36 +91,41 @@ def parse_args():
     parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
     parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
     parser.add_argument('--c_out', type=int, default=7, help='output size')
-    parser.add_argument('--d_model', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
-    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
-    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
-    parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
-
+    parser.add_argument('--embed', type=str, default='timeF', help='time features encoding, options:[timeF, fixed, learned]')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
-    parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding, options:[timeF, fixed, learned]')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
+
+    parser.add_argument('--d_model', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
+    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
+    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
+    parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
+    parser.add_argument('--temperature', type=float, default=1.0, help='temperature')
     parser.add_argument('--cluster_num', type=int, default=16, help='cluster number')
     parser.add_argument('--topk', type=int, default=512, help='topk')
     parser.add_argument('--topkmode', type=str, default='select', help='select or all')
     parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
+    parser.add_argument('--hmm_reg', type=float, default=0.01, help='hmm regularization')
+    parser.add_argument('--entropy_reg', type=float, default=1, help='entropy regularization')
     parser.add_argument('--hmm_pretrained_flag', type=int, default=0, help='is pretrain')
+    parser.add_argument('--hmm_pretrain_mode', type=str, default='ll', help='ll+diag+entropy')
     parser.add_argument('--load_hmm_flag', type=int, default=1, help='is load hmm')
+    parser.add_argument('--linear_layer', type=int, default=1, help='linear layer')
+    parser.add_argument('--diag_max', type=float, default=0.7, help='diag max')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='optimizer learning rate')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
-    parser.add_argument('--pretrain_epochs', type=int, default=3, help='pretrain hmm epochs')
+    parser.add_argument('--pretrain_epochs', type=int, default=2, help='pretrain hmm epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--eval_batch_size', type=int, default=32, help='batch size of model evaluation')
     parser.add_argument('--eval_interval_iters', type=int, default=200, help='max epochs')
     parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
-    parser.add_argument('--learning_rate', type=float, default=1e-3, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
@@ -153,10 +158,10 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_df{}_eb{}_cn{}_tk{}_tkm{}_{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
-            args.seq_len, args.label_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.embed, args.cluster_num, args.topk, args.topkmode, ii)
+            args.seq_len, args.pred_len, args.d_model, args.n_heads,
+            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -195,7 +200,7 @@ def main():
         _, text_dataloader = text_data_provider(args)
 
         if args.load_hmm_flag:
-            pretrain_hmm_path = os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_checkpoint.pth')
+            pretrain_hmm_path = os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_{args.hmm_pretrain_mode}_checkpoint.pth')
             if os.path.exists(pretrain_hmm_path):
                 print(f"Pretrained HMM found at {pretrain_hmm_path}.")
                 full_model_state = torch.load(pretrain_hmm_path, map_location=device)
@@ -203,7 +208,7 @@ def main():
 
         if not args.hmm_pretrained_flag:
             # === Phase 1: Train text HMM for 5 epochs ===
-            print("Starting Phase 1: Training text HMM for 5 epochs")
+            print(f"Starting Phase 1: Training text HMM for {args.pretrain_epochs} epochs")
             model.train()
             for epoch in range(args.pretrain_epochs):  
                 epoch_time = time.time()
@@ -236,7 +241,7 @@ def main():
                                 plt.savefig(os.path.join(check_pth, f'transition_matrix_heatmap_{epoch + 1}-{batch_idx}.png'), bbox_inches="tight")
                                 plt.close()
                                 hmm_checkpoint = model.wiki_hmm.state_dict()
-                                torch.save(hmm_checkpoint, os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_checkpoint.pth'))
+                                torch.save(hmm_checkpoint, os.path.join(args.checkpoints, f'hmm_{args.cluster_num}_{args.hmm_pretrain_mode}_checkpoint.pth'))
                                 print(f"Saved checkpoint for hmm pretraining")
 
                 avg_train_loss = epoch_loss / len(text_dataloader)
@@ -288,9 +293,9 @@ def main():
                 if 'mse' in args.loss_mode:
                     loss += mseloss
                 if 'hmm' in args.loss_mode:
-                    loss += likelihood_loss
+                    loss += args.hmm_reg * likelihood_loss
                 if 'entropy' in args.loss_mode:
-                    loss += entropy_loss
+                    loss += args.entropy_reg * entropy_loss
 
                 model_optim.zero_grad()
                 loss.backward()
@@ -304,9 +309,9 @@ def main():
                 torch.cuda.empty_cache()
 
                 pbar.set_postfix({
-                    'mse': train_mseloss / (batch_idx + 1),  
-                    'entropy_loss': train_entropy_loss / (batch_idx + 1),                     
-                    'hmm_loss': train_hmm_loss / (batch_idx + 1)
+                    'mse': mseloss.cpu().detach().item(),  
+                    'entropy_loss': entropy_loss.cpu().detach().item(),                     
+                    'hmm_loss': likelihood_loss.cpu().detach().item()
                 })
 
                 if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1:
@@ -326,7 +331,7 @@ def main():
                 # print(f"mse: {train_mseloss / (batch_idx + 1)}, entropy_loss: {train_entropy_loss / (batch_idx + 1)}, hmm_loss: {train_hmm_loss / (batch_idx + 1)}", end='\r')
            
 
-            print(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
+            logger.info(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
                   f"HMM Loss: {train_hmm_loss / len(train_loader):.7f} | "
                   f"MSE Loss: {train_mseloss / len(train_loader):.7f} | "
                   f"Entropy Loss: {train_entropy_loss / len(train_loader):.7f} ")

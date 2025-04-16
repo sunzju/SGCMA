@@ -143,8 +143,8 @@ def del_files(dir_path):
 
 def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric):
     device = next(model.parameters()).device
-    total_mseloss = []
-    total_mae_loss = []
+    total_mseloss = 0
+    total_mae_loss = 0
 
     # 加载保存的 emission_logits
     # init_logits_path = os.path.join('pretrain_model/vali', 'epoch_init_logits.pt')
@@ -166,10 +166,8 @@ def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
 
             outputs, _ ,_, _, _= model(batch_x, 
-                                  text_input=None, 
-                                  epoch_init_logits=model.wiki_hmm.init_logits, 
-                                  epoch_transition_logits=model.wiki_hmm.transition_logits, 
-                                  epoch_emission_logits=model.wiki_hmm.emission_logits)
+                                  text_input=None,
+                                  is_pretrain=False)
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
@@ -181,11 +179,11 @@ def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric
             mseloss = criterion(pred, true)
             mae_loss = mae_metric(pred, true)
             
-            total_mseloss.append(mseloss.item())
-            total_mae_loss.append(mae_loss.item())
+            total_mseloss += mseloss.cpu().detach().item()
+            total_mae_loss += mae_loss.cpu().detach().item()
     
-    total_mseloss = np.average(total_mseloss)
-    total_mae_loss = np.average(total_mae_loss)
+    total_mseloss = total_mseloss / len(vali_loader)
+    total_mae_loss = total_mae_loss / len(vali_loader)
     model.train()
     return total_mseloss, total_mae_loss
 

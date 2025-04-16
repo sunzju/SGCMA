@@ -80,29 +80,30 @@ class WikiHMM(nn.Module):
         transition_entropy = torch.sum(info_mat, dim=1)  # [hidden_state_num]
         transition_entropy_loss = transition_entropy.mean()  # 熵的平均值
 
-        # # (2) maintain a large self-transition probability
-        # self_trans_const = 100 / torch.norm(torch.diag(text_A), p=2)
-        # diag_reg = torch.sum(F.relu(torch.diag(text_A) - self.diag_max).pow(2))
+        # (2) maintain a large self-transition probability
+        self_trans_const = 100 / torch.norm(torch.diag(text_A), p=2)
+        diag_reg = torch.sum(F.relu(torch.diag(text_A) - self.diag_max).pow(2))
 
 
-        return text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const
+        return text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
 
 # FlattenHead：展平并输出预测结果
 class FlattenHead(nn.Module):
-    def __init__(self, n_vars, nf, target_window, head_dropout=0):
+    def __init__(self, n_vars, nf, target_window, head_dropout=0.1, linear_layer=3):
         super().__init__()
         self.n_vars = n_vars
         self.flatten = nn.Flatten(start_dim=-2)
-        self.linear = nn.Sequential(nn.Linear(nf, 512),
-                                    nn.GELU(),
-                                    nn.Dropout(head_dropout),
-                                    nn.Linear(512, 512),
-                                    nn.GELU(),
-                                    nn.Dropout(head_dropout),
-                                    nn.Linear(512, 512),
-                                    nn.GELU(),
-                                    nn.Dropout(head_dropout),
-                                    nn.Linear(512, target_window))
+        if linear_layer == 1:
+            self.linear = nn.Linear(nf, target_window)
+
+        else:
+            ls = [nn.Linear(nf, 512), nn.GELU(), nn.Dropout(head_dropout)]
+            for _ in range(linear_layer - 2):
+                ls.append(nn.Linear(512, 512))
+                ls.append(nn.GELU())
+                ls.append(nn.Dropout(head_dropout))
+            ls.append(nn.Linear(512, target_window))
+            self.linear = nn.Sequential(*ls)
 
     def forward(self, x):  # x: [bs, nvars, d_ff, patch_num]
         x = self.flatten(x)  # x: [bs, nvars, d_ff * patch_num]
@@ -222,7 +223,7 @@ class TSAligner(nn.Module):
     输入: TSCluster返回的cluster_probs, emb_all。cluster_probs: 聚类软标签概率, 形状[B, patch_num, cluster_num]  ts_emb: 时间序列patch嵌入, 形状[B, patch_num, d_model]  
     输出: fused_emb: [B, patch_num, d_llm] - 融合后的嵌入
     """
-    def __init__(self, cluster_num, d_model, n_heads, d_llm, attention_dropout=0.1):
+    def __init__(self, cluster_num, d_model, n_heads, d_llm, attention_dropout=0.1, temperature=None):
         super(TSAligner, self).__init__()
         self.cluster_num = cluster_num
         self.d_model = d_model
@@ -234,7 +235,7 @@ class TSAligner(nn.Module):
         #     CrossAttentionLayer(d_model, n_heads, d_llm=d_llm, attention_dropout=attention_dropout)
         #     for _ in range(cluster_num)
         # ])
-        self.crossattention_layers = CrossAttentionLayer(d_model, n_heads, cluster_num, d_llm=d_llm, attention_dropout=attention_dropout)
+        self.crossattention_layers = CrossAttentionLayer(d_model, n_heads, cluster_num, d_llm=d_llm, attention_dropout=attention_dropout, temperature=temperature)
 
     def forward(self, topk_token_embeddings, ts_emb, cluster_probs):   
         # B, P, _ = ts_emb.shape  # [B, patch_num, d_model]
@@ -264,7 +265,7 @@ class CrossAttentionLayer(nn.Module):
     output:
         融合了文本特征且映射到d_llm的时序patch (B, patch_num, d_llm)
     """
-    def __init__(self, d_model, n_heads, n_cls=100, d_keys=None, d_llm=None, attention_dropout=0.1):
+    def __init__(self, d_model, n_heads, n_cls=100, d_keys=None, d_llm=None, attention_dropout=0.1, temperature=None):
         super(CrossAttentionLayer, self).__init__()
 
         self.n_cls = n_cls
@@ -283,6 +284,7 @@ class CrossAttentionLayer(nn.Module):
 
         self.n_heads = n_heads
         self.dropout = nn.Dropout(attention_dropout)
+        self.temperature = temperature or 1. / sqrt(self.d_keys)
 
     def forward(self, target_embedding, source_embedding, value_embedding):
         """
@@ -295,11 +297,8 @@ class CrossAttentionLayer(nn.Module):
         source_embedding = torch.einsum("ckd,ched->kche", source_embedding, self.key_projection[...,:-1]) + self.key_projection[..., -1] # [k, c, H, d_keys]
         value_embedding = torch.einsum("ckd,ched->kche", value_embedding, self.value_projection[...,:-1]) + self.value_projection[..., -1] # [k, c, H, d_keys]
 
-
-        scale = 1. / sqrt(self.d_keys)
-
         att_score = torch.einsum("blchd,kche->bchlk", target_embedding, source_embedding) # [B, c, H, L, k]
-        att_score = self.dropout(torch.softmax(scale * att_score, dim=-1))
+        att_score = self.dropout(torch.softmax(self.temperature * att_score, dim=-1))
         out_value = torch.einsum("bchlk,kchd->bclhd", att_score, value_embedding) # [B, c, L, H, d_keys]
 
         # out = out.reshape(B, L, -1)    # [B, L, H*d_keys]
@@ -381,7 +380,7 @@ class Model(nn.Module):
         self.local_word_embeddings = self.word_embeddings[self.local_to_gpt2]
 
         """实例化 WikiHMM 模块: self.wiki_hmm"""
-        self.wiki_hmm = WikiHMM(self.cluster_num, configs.colsum_threshold)
+        self.wiki_hmm = WikiHMM(self.cluster_num, configs.diag_max)
 
         """实例化 Normalize 模块: self.normalize_layers"""
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
@@ -402,30 +401,30 @@ class Model(nn.Module):
         self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num)
 
         """实例化 TSAligner 模块: self.ts_aligner"""
-        self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=0.1)
+        self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=configs.dropout, temperature=configs.temperature)
 
         """用在GPT2最后一个隐藏层输出, 先进行一步降维到d_ff=32"""
         self.projection = nn.Linear(self.d_llm, self.d_ff)
 
         """实例化 FlattenHead 模块: self.output_projection"""
         self.head_nf = self.d_ff * self.patch_num
-        self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout)
+        self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout, linear_layer=configs.linear_layer)
         
         
-    def forward(self, x_enc=None, text_input=None, epoch_init_logits=None, epoch_transition_logits=None, epoch_emission_logits=None,is_pretrain=False):   
+    def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
         if is_pretrain:
-            _, _, _, likelihood_loss, transition_entropy_loss, cnct_const = self.wiki_hmm(text_input)
-            return likelihood_loss, transition_entropy_loss, cnct_const
+            _, _, _, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const = self.wiki_hmm(text_input)
+            return likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
         else:
-            dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = self.forecast(x_enc, text_input, epoch_init_logits, epoch_transition_logits, epoch_emission_logits)
+            dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = self.forecast(x_enc, text_input)
             return dec_out[:, -self.pred_len:, :], likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
     
         
-    def forecast(self, x_enc, text_input=None, epoch_init_logits=None, epoch_transition_logits=None, epoch_emission_logits=None):
+    def forecast(self, x_enc, text_input=None):
         # 训练时
         if text_input is not None:
             """调用 wiki_hmm 模块: self.wiki_hmm"""
-            text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const = self.wiki_hmm(text_input)
+            text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
 
             """原始输入 x_enc: [bs, seq_len, n_vars]"""
 
