@@ -55,7 +55,6 @@ def parse_args():
     parser.add_argument('--model_comment', type=str, default='none', help='prefix when saving test results')
     parser.add_argument('--model', type=str, default='Mymodel',
                         help='model name, options: [Autoformer, DLinear, Mymodel]')
-    parser.add_argument('--seed', type=int, default=2021, help='random seed')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
 
     # wikihmm
@@ -99,32 +98,34 @@ def parse_args():
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
 
+    parser.add_argument('--seed', type=int, default=2025, help='random seed')
     parser.add_argument('--d_model', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
     parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
     parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
     parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
     parser.add_argument('--temperature', type=float, default=1.0, help='temperature')
-    parser.add_argument('--cluster_num', type=int, default=16, help='cluster number')
+    parser.add_argument('--cluster_num', type=int, default=32, help='cluster number')
     parser.add_argument('--topk', type=int, default=512, help='topk')
     parser.add_argument('--topkmode', type=str, default='select', help='select or all')
     parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
-    parser.add_argument('--hmm_reg', type=float, default=0.01, help='hmm regularization')
+    parser.add_argument('--hmm_reg', type=float, default=0.1, help='hmm regularization')
     parser.add_argument('--entropy_reg', type=float, default=1, help='entropy regularization')
-    parser.add_argument('--hmm_pretrained_flag', type=int, default=0, help='is pretrain')
+    parser.add_argument('--hmm_pretrained_flag', type=int, default=1, help='is pretrain')
     parser.add_argument('--hmm_pretrain_mode', type=str, default='ll', help='ll+diag+entropy')
     parser.add_argument('--load_hmm_flag', type=int, default=1, help='is load hmm')
     parser.add_argument('--linear_layer', type=int, default=1, help='linear layer')
     parser.add_argument('--diag_max', type=float, default=0.7, help='diag max')
-    parser.add_argument('--learning_rate', type=float, default=1e-3, help='optimizer learning rate')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='optimizer learning rate')
+    parser.add_argument('--eval_interval_iters', type=int, default=100, help='max epochs')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
     parser.add_argument('--pretrain_epochs', type=int, default=2, help='pretrain hmm epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
-    parser.add_argument('--eval_batch_size', type=int, default=32, help='batch size of model evaluation')
-    parser.add_argument('--eval_interval_iters', type=int, default=200, help='max epochs')
+    parser.add_argument('--batch_size', type=int, default=256, help='batch size of train input data')
+    parser.add_argument('--eval_batch_size', type=int, default=256, help='batch size of model evaluation')
+
     parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
@@ -224,7 +225,7 @@ def main():
                         sentences = sentences.to(device)
                         sentences_mapped = remap_tokens_to_local_vocab(sentences, gpt2_to_local) 
                         model_optim.zero_grad()
-                        likelihood_loss, transition_entropy_loss, cnct_const = model(text_input=sentences_mapped, is_pretrain=True)  # is_pretrain=True，则hmm_loss= self.wiki_hmm(text_input)                    
+                        likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const = model(text_input=sentences_mapped, is_pretrain=True)  # is_pretrain=True，则hmm_loss= self.wiki_hmm(text_input)                    
                         hmm_loss = likelihood_loss
                         hmm_loss.backward()
                         model_optim.step()

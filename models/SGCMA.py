@@ -213,8 +213,11 @@ class TSCluster(nn.Module):
             all_logit_result.append(logit_t)
         cluster_probs = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
         # 计算熵损失，鼓励概率分布集中
-        entropy_loss = -torch.sum(cluster_probs * torch.log(cluster_probs + 1e-10), dim=-1).mean()
-        return cluster_probs, emb_ts, ts_pi, ts_A, entropy_loss
+        entropy_loss_patch_mean = -torch.sum(cluster_probs * torch.log(cluster_probs + 1e-10), dim=-1).mean()
+        # mean_prob_each_cluster = torch.mean(cluster_probs, dim=-2)
+        # entropy_loss_each_cluster = torch.sum(mean_prob_each_cluster * torch.log(mean_prob_each_cluster + 1e-10), dim=-1).mean()
+        # entropy_loss = entropy_loss_per_patch + entropy_loss_each_cluster
+        return cluster_probs, emb_ts, ts_pi, ts_A, entropy_loss_patch_mean
 
 
 """将时间序列 patch 与文本 token embeddings 进行 cross-attention 并加权融合, 100个类使用了100个CrossAttentionLayer实例"""
@@ -307,6 +310,58 @@ class CrossAttentionLayer(nn.Module):
         return aligned_ts  # [B, L, c, d_llm]
     
 
+class CrossAttentionLayer_old(nn.Module):
+    """
+    input:
+        TSCluster返回的target_embedding: (B, patch_num, d_model)
+        source_embedding: (S, d_llm)
+        value_embedding: (S, d_llm)
+    output:
+        融合了文本特征且映射到d_llm的时序patch (B, patch_num, d_llm)
+    """
+    def __init__(self, d_model, n_heads, d_keys=None, d_llm=None, attention_dropout=0.1):
+        super(CrossAttentionLayer_old, self).__init__()
+
+        d_keys = d_keys or (d_model // n_heads)
+
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_llm, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_llm, d_keys * n_heads)
+
+        self.out_projection = nn.Linear(d_keys * n_heads, d_llm)  # 将融合了文本原型后的时序patch，映射到LLM的维度，d_model -> d_llm
+        self.n_heads = n_heads
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def forward(self, target_embedding, source_embedding, value_embedding):
+        B, L, _ = target_embedding.shape
+        B, L, _ = source_embedding.shape
+        H = self.n_heads
+
+        target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)  # [B, L, H, d_keys]
+        source_embedding = self.key_projection(source_embedding).view(B, L, H, -1)       # [B, L, H, d_keys]
+        value_embedding = self.value_projection(value_embedding).view(B, L, H, -1)       # [B, L, H, d_keys]
+
+        out = self.crossattention(target_embedding, source_embedding, value_embedding) # [B, L, H, d_keys]
+
+        out = out.reshape(B, L, -1)    # [B, L, H*d_keys]
+        aligned_ts = self.out_projection(out)
+        return aligned_ts  # [B, L, d_llm]
+    
+    def crossattention(self, target_embedding, source_embedding, value_embedding):
+        B, L, H, E = target_embedding.shape
+
+        scale = 1. / sqrt(E)
+
+        # this is the attention scores, (B, L, H, S), using the Einstein summation convention
+        scores = torch.einsum("blhe,bshe->bhls", target_embedding, source_embedding)
+
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+
+        # apply the attention score to value embedding and output the reprogramming embedding
+        crossattention_embedding = torch.einsum("bhls,bshe->blhe", A, value_embedding)
+
+        return crossattention_embedding  # (B, L, H, E)
+    
 # 主模型类
 class Model(nn.Module):
     def __init__(self, configs):
@@ -403,8 +458,11 @@ class Model(nn.Module):
         """实例化 TSAligner 模块: self.ts_aligner"""
         self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=configs.dropout, temperature=configs.temperature)
 
+        # self.ts_llm_fusion = CrossAttentionLayer_old(configs.d_model, self.n_heads, d_llm=self.d_llm)
+
         """用在GPT2最后一个隐藏层输出, 先进行一步降维到d_ff=32"""
-        self.projection = nn.Linear(self.d_llm + self.d_model, self.d_ff)
+        self.projection = nn.Linear(self.d_llm, self.d_ff)
+        # self.projection = nn.Linear(self.d_llm + self.d_model, self.d_ff)
 
         """实例化 FlattenHead 模块: self.output_projection"""
         self.head_nf = self.d_ff * self.patch_num
@@ -455,8 +513,13 @@ class Model(nn.Module):
             
             """ 输入 LLM """
             dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  # [bs*n_vars, patch_num, d_llm]
+
+            """调用 self.ts_llm_fusion"""
+            # dec_fusion = self.ts_llm_fusion(ts_embedding, dec_out, dec_out)  # [bs*n_vars, patch_num, d_llm]
+
             """调用 self.projection, 将GPT2隐藏层输出先进行一次降维"""
-            dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  # [bs*n_vars, patch_num, d_ff]
+            dec_out = self.projection(dec_out)  # [bs*n_vars, patch_num, d_ff]
+            # dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  # [bs*n_vars, patch_num, d_ff]
 
             # 重塑形状
             dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
@@ -485,7 +548,9 @@ class Model(nn.Module):
             cluster_probs, ts_embedding, ts_pi, ts_A, entropy_loss = self.ts_cluster(enc_out,text_pi,text_A)
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs) 
             dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  
-            dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  
+            # dec_out = self.ts_llm_fusion(ts_embedding, dec_out, dec_out)
+            dec_out = self.projection(dec_out)  
+            # dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  
             dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
             dec_out = dec_out.permute(0, 1, 3, 2).contiguous() 
             dec_out = self.output_projection(dec_out)  
