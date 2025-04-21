@@ -11,6 +11,8 @@ from math import sqrt
 import logging
 import os
 import time
+# from peft import LoraConfig, TaskType, get_peft_model
+
 
 from layers.StandardNorm import Normalize
 
@@ -33,9 +35,9 @@ class WikiHMM(nn.Module):
         seq_length = text_input.shape[1]
 
         # === 1. 将logits转换成概率 ===
-        text_pi = F.softmax(self.init_logits, dim=0)
-        text_A = F.softmax(self.transition_logits, dim=1)
-        text_B = F.softmax(self.emission_logits, dim=1)
+        # text_pi = F.softmax(self.init_logits, dim=0)
+        # text_A = F.softmax(self.transition_logits, dim=1)
+        # text_B = F.softmax(self.emission_logits, dim=1)
         
         # logger.debug(f"text_pi:{text_pi}")
         # logger.debug(f"text_A: {text_A}")
@@ -43,9 +45,9 @@ class WikiHMM(nn.Module):
         # 计算状态转移矩阵、发射矩阵信息熵
 
         # === 2. 对数前向算法 （在数值稳定的对数空间进行，因为概率相乘数值会越来越小） ===
-        log_pi = torch.log(text_pi + 1e-10)
-        log_A = torch.log(text_A + 1e-10)
-        log_B = torch.log(text_B + 1e-10)
+        log_pi = self.init_logits - torch.logsumexp(self.init_logits, dim=0, keepdim=True)
+        log_A = self.transition_logits - torch.logsumexp(self.transition_logits, dim=1, keepdim=True)
+        log_B = self.emission_logits - torch.logsumexp(self.emission_logits, dim=1, keepdim=True)
 
         log_likelihoods = torch.full((batch_size, seq_length), -float('inf'), device = text_input.device)
 
@@ -68,11 +70,11 @@ class WikiHMM(nn.Module):
         log_likelihood = log_likelihoods[batch_indices, seq_length-1]
         likelihood_loss = -log_likelihood.mean()
 
-        info_mat = - text_A * torch.log(text_A + 1e-10) # [hidden_state_num, hidden_state_num]
+        info_mat = - torch.exp(log_A) * log_A # [hidden_state_num, hidden_state_num]
 
         # === 4. Connectiveity Constraint ===
 
-        mean_prob_trans2cls = torch.mean(text_A, dim=0) # [hidden_state_num]
+        mean_prob_trans2cls = torch.mean(torch.exp(log_A), dim=0) # [hidden_state_num]
         cnct_const = - torch.sum(mean_prob_trans2cls * torch.log(mean_prob_trans2cls + 1e-10)) # 要让这个熵尽量大
 
         # === 5. 正则化项 ===
@@ -81,11 +83,11 @@ class WikiHMM(nn.Module):
         transition_entropy_loss = transition_entropy.mean()  # 熵的平均值
 
         # (2) maintain a large self-transition probability
-        self_trans_const = 100 / torch.norm(torch.diag(text_A), p=2)
-        diag_reg = torch.sum(F.relu(torch.diag(text_A) - self.diag_max).pow(2))
+        self_trans_const = 100 / torch.norm(torch.diag(torch.exp(log_A)), p=2)
+        diag_reg = torch.sum(F.relu(torch.diag(torch.exp(log_A)) - self.diag_max).pow(2))
 
 
-        return text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
+        return log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
 
 # FlattenHead：展平并输出预测结果
 class FlattenHead(nn.Module):
@@ -170,8 +172,7 @@ class ClusterCenters(nn.Module):
         # 计算每个 patch 到每个聚类中心的平方距离
         mu_diff = (x_expanded - mus_expanded) ** 2   # [B, patch_num, cluster_num, embedding_dim]，这是在embedding上逐个维度的差
         mu_diff = mu_diff.sum(dim=-1)
-        mu_diff_exp = torch.exp(-mu_diff / self.temperature)  
-        z_p = mu_diff_exp / mu_diff_exp.sum(dim=-1, keepdim=True) # 距离越小概率越大
+        z_p = - mu_diff / self.temperature
         return z_p   # [B, patch_num, cluster_num]
 
 class TSCluster(nn.Module):
@@ -181,7 +182,7 @@ class TSCluster(nn.Module):
           熵损失 entropy_loss
           中间输出特征提取结果emb_all:[bs*n_vars, patch_num, hidden_dim], 以便后续进行crossattention使用  
     """
-    def __init__(self, bkb_kargs, hidden_dim, cluster_num, patch_num):
+    def __init__(self, bkb_kargs, hidden_dim, cluster_num, patch_num, train_trans=False):
         super(TSCluster, self).__init__()
         self.cluster_num = cluster_num
         self.patch_num = patch_num
@@ -191,33 +192,45 @@ class TSCluster(nn.Module):
 
         """实例化 ClusterCenters: self.cluster_centers"""
         self.cluster_centers = ClusterCenters(hidden_dim, cluster_num)
+        self.train_trans = train_trans
+        if train_trans:
+            self.transition_matrix = nn.Parameter(torch.randn(cluster_num, cluster_num))
+            self.init_logits = nn.Parameter(torch.randn(cluster_num))
     
-    def forward(self, input_series, text_pi, text_A):   # input_series: [bs*n_vars, patch_num, patch_len]
+    def forward(self, input_series, log_pi=None, log_A=None):   # input_series: [bs*n_vars, patch_num, patch_len]
         emb_ts = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
         logits_all = self.cluster_centers(emb_ts)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
-        
-        ts_pi = text_pi
-        ts_A = text_A
 
-        logit_t = torch.tile(ts_pi, (logits_all.shape[0], 1))  # self.ts_pi 复制到批次大小（B） [bs*n_vars, cluster_num]
+        # transform logits to log probability
+        logits_all = logits_all - torch.logsumexp(logits_all, dim=-1, keepdim=True)
+
+        if self.train_trans:
+            log_pi = self.init_logits - torch.logsumexp(self.init_logits, dim=0, keepdim=True)
+            log_A = self.transition_matrix - torch.logsumexp(self.transition_matrix, dim=1, keepdim=True)
+
+        log_pi = torch.tile(log_pi, (logits_all.shape[0], 1))  # self.ts_pi 复制到批次大小（B） [bs*n_vars, cluster_num]
         all_logit_result = []
         # 初始时间步0：直接用初始状态和第一个patch的概率分布
-        logit_t = torch.log(logit_t + 1e-10) + torch.log(logits_all[:, 0] + 1e-10)  # 第 2 维（cluster_num）未指定，PyTorch 默认取整个维度，不用写logits_all[:, 0, :]
-        logit_t = torch.softmax(logit_t, dim=1) # 归一化
-        all_logit_result.append(logit_t)
+        log_t = log_pi + logits_all[:, 0]  # 
+        log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
+        # logit_t = torch.softmax(logit_t, dim=1) # 归一化
+        all_logit_result.append(log_t)
         # 后续时间步
-        for i in range(1, self.patch_num):
-            logit_t = torch.matmul(logit_t, ts_A)  # 计算下一个时间步的隐藏状态分布 (bs*n_vars, cluster_num)
-            logit_t = torch.log(logit_t + 1e-10) + torch.log(logits_all[:, i] + 1e-10) 
-            logit_t = torch.softmax(logit_t, dim=1)  # 归一化
-            all_logit_result.append(logit_t)
+        for t in range(1, self.patch_num):
+            log_t = (log_t[...,None,:] + log_A.T).sum(dim=-1)  # 计算下一个时间步的隐藏状态分布 (bs*n_vars, cluster_num)
+            log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
+            log_t = log_t + logits_all[:, t]
+            log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
+            all_logit_result.append(log_t)
         cluster_probs = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
+        entropy_loss_patch_mean = -torch.sum(torch.exp(cluster_probs) * cluster_probs, dim=-1).mean()
+        cluster_probs = torch.exp(cluster_probs)
         # 计算熵损失，鼓励概率分布集中
-        entropy_loss_patch_mean = -torch.sum(cluster_probs * torch.log(cluster_probs + 1e-10), dim=-1).mean()
+
         # mean_prob_each_cluster = torch.mean(cluster_probs, dim=-2)
         # entropy_loss_each_cluster = torch.sum(mean_prob_each_cluster * torch.log(mean_prob_each_cluster + 1e-10), dim=-1).mean()
         # entropy_loss = entropy_loss_per_patch + entropy_loss_each_cluster
-        return cluster_probs, emb_ts, ts_pi, ts_A, entropy_loss_patch_mean
+        return cluster_probs, emb_ts, log_pi, log_A, entropy_loss_patch_mean
 
 
 """将时间序列 patch 与文本 token embeddings 进行 cross-attention 并加权融合, 100个类使用了100个CrossAttentionLayer实例"""
@@ -253,7 +266,7 @@ class TSAligner(nn.Module):
         #     weight = cluster_probs[:, :, [c]]  # [B, patch_num, 1]
         #     aligned_embs.append(aligned * weight)  # [B, patch_num, d_llm]
 
-        aligned = self.crossattention_layers(ts_emb, topk_token_embeddings, topk_token_embeddings) # [B, patch_num, d_llm, c]
+        aligned = self.crossattention_layers(ts_emb, topk_token_embeddings, topk_token_embeddings) # [B, L, c, d_llm]
 
         # 融合所有聚类的加权嵌入
         fused_emb = torch.sum(aligned * cluster_probs[:, :, :, None], dim=-2)  # [B, patch_num, d_llm]
@@ -277,9 +290,9 @@ class CrossAttentionLayer(nn.Module):
 
         self.d_keys = d_keys
 
-        self.query_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_model + 1)) # +1 用于bias
-        self.key_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
-        self.value_projection = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm + 1)) # +1 用于bias
+        self.query_projection = nn.Parameter(torch.randn(n_cls, n_heads * d_keys, d_model + 1)) # +1 用于bias
+        self.key_projection = nn.Parameter(torch.randn(n_cls, n_heads * d_keys, d_llm + 1)) # +1 用于bias
+        self.value_projection = nn.Parameter(torch.randn(n_cls, n_heads * d_keys, d_llm + 1)) # +1 用于bias
 
         # self.out_projection = nn.Linear(d_keys * n_heads, d_llm)  # 将融合了文本原型后的时序patch，映射到LLM的维度，d_model -> d_llm
         self.out_projection_w = nn.Parameter(torch.randn(n_cls, n_heads, d_keys, d_llm))
@@ -295,12 +308,19 @@ class CrossAttentionLayer(nn.Module):
         source_embedding: (n_cluster, k, d_llm)
         value_embedding: (n_cluster, k, d_llm) the same as source_embedding
         """
+        B, L, d_model = target_embedding.shape
+        c, k, d_llm = source_embedding.shape
+        H = self.n_heads
+        d_keys = self.d_keys
 
-        target_embedding = torch.einsum("bld,ched->blche", target_embedding, self.query_projection[...,:-1]) + self.query_projection[..., -1] # [B, L, c, H, d_keys]
-        source_embedding = torch.einsum("ckd,ched->kche", source_embedding, self.key_projection[...,:-1]) + self.key_projection[..., -1] # [k, c, H, d_keys]
-        value_embedding = torch.einsum("ckd,ched->kche", value_embedding, self.value_projection[...,:-1]) + self.value_projection[..., -1] # [k, c, H, d_keys]
+        target_embedding = torch.einsum("bld,cgd->blcg", target_embedding, self.query_projection[...,:-1]) + self.query_projection[..., -1] # [B, L, c, H * d_keys]
+        target_embedding = target_embedding.view(B, L, c, H, d_keys)
+        source_embedding = torch.einsum("ckd,cgd->kcg", source_embedding, self.key_projection[...,:-1]) + self.key_projection[..., -1] # [k, c, H * d_keys]
+        source_embedding = source_embedding.view(k, c, H, d_keys)
+        value_embedding = torch.einsum("ckd,cgd->kcg", value_embedding, self.value_projection[...,:-1]) + self.value_projection[..., -1] # [k, c, H * d_keys]
+        value_embedding = value_embedding.view(k, c, H, d_keys)
 
-        att_score = torch.einsum("blchd,kche->bchlk", target_embedding, source_embedding) # [B, c, H, L, k]
+        att_score = torch.einsum("blchd,kchd->bchlk", target_embedding, source_embedding) # [B, c, H, L, k]
         att_score = self.dropout(torch.softmax(self.temperature * att_score, dim=-1))
         out_value = torch.einsum("bchlk,kchd->bclhd", att_score, value_embedding) # [B, c, L, H, d_keys]
 
@@ -404,6 +424,15 @@ class Model(nn.Module):
                     r'gpt2',
                     local_files_only=True
                 )
+        
+        # peft_config = LoraConfig(
+        #     task_type=TaskType.CAUSAL_LM,  # 指定任务类型为因果语言建模，适合序列生成任务
+        #     inference_mode=False,    # 表示模型处于训练模式
+        #     r=configs.r,   # LoRA的秩，控制低秩矩阵的规模  =8
+        #     lora_alpha=configs.lora_alpha,   # LoRA的缩放因子，调整适配强度  =32
+        #     lora_dropout=configs.lora_dropout,  # Dropout概率，防止过拟合  =0.1
+        #     target_modules=["c_attn"]   # 指定LoRA适配的模块为GPT-2的注意力层（c_attn）
+        # )
         if self.tokenizer.eos_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
@@ -421,8 +450,6 @@ class Model(nn.Module):
 
         # 获取 LLM 的全部词嵌入
         self.word_embeddings = self.llm_model.get_input_embeddings().weight  # [50256, d_llm]
-
-
 
         # 加载gpt2_to_local_id字典
         gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
@@ -465,7 +492,9 @@ class Model(nn.Module):
         # self.projection = nn.Linear(self.d_llm + self.d_model, self.d_ff)
 
         """实例化 FlattenHead 模块: self.output_projection"""
-        self.head_nf = self.d_ff * self.patch_num
+        # self.head_nf = self.d_ff * self.patch_num
+        self.valid_patch = (self.pred_len + self.stride - self.patch_len) // self.stride + 1
+        self.head_nf = self.d_ff * self.valid_patch
         self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout, linear_layer=configs.linear_layer)
         
         
@@ -482,7 +511,7 @@ class Model(nn.Module):
         # 训练时
         if text_input is not None:
             """调用 wiki_hmm 模块: self.wiki_hmm"""
-            text_pi, text_A, text_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
+            log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
 
             """原始输入 x_enc: [bs, seq_len, n_vars]"""
 
@@ -498,11 +527,11 @@ class Model(nn.Module):
             enc_out = self.patch_projection(x_patched) # [bs*n_vars, patch_num, d_model]
 
             """调用 TSCluster 模块: self.ts_cluster"""
-            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, text_pi, text_A)  # [bs*n_vars, patch_num, cluster_num]
+            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, log_pi, log_A)  # [bs*n_vars, patch_num, cluster_num]
 
             """获取topk token embedding for all clusters"""
             if self.topkmode == 'select':
-                _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1) # [n_cluster, topk]
+                _, topk_local_indices = torch.topk(log_B, k = self.topk, dim=1) # [n_cluster, topk]
                 # 直接用tensor索引映射到gpt2_id
                 topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
                 topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
@@ -512,7 +541,7 @@ class Model(nn.Module):
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs)  # [bs*n_vars, patch_num, d_llm]
             
             """ 输入 LLM """
-            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  # [bs*n_vars, patch_num, d_llm]
+            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state[:, -self.valid_patch:, :]  # [bs*n_vars, patch_num, d_llm]
 
             """调用 self.ts_llm_fusion"""
             # dec_fusion = self.ts_llm_fusion(ts_embedding, dec_out, dec_out)  # [bs*n_vars, patch_num, d_llm]
@@ -532,11 +561,17 @@ class Model(nn.Module):
             dec_out = self.normalize_layers(dec_out, 'denorm')
             return dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
         else:
-            text_pi = F.softmax(self.wiki_hmm.init_logits.detach(), dim=0)
-            text_A = F.softmax(self.wiki_hmm.transition_logits.detach(), dim =1)
-            text_B = F.softmax(self.wiki_hmm.emission_logits.detach(), dim=1)
+            logit_pi = self.wiki_hmm.init_logits.detach()
+            logit_A = self.wiki_hmm.transition_logits.detach()
+            logit_B = self.wiki_hmm.emission_logits.detach()
 
-            _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1)
+            log_pi = logit_pi - torch.logsumexp(logit_A, dim=0, keepdim=True)
+            log_A = logit_A - torch.logsumexp(logit_A, dim=1, keepdim=True)
+            log_B = logit_B - torch.logsumexp(logit_B, dim=1, keepdim=True)
+
+
+
+            _, topk_local_indices = torch.topk(log_B, k = self.topk, dim=1)
             topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
             topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] 
 
@@ -545,9 +580,9 @@ class Model(nn.Module):
             x_enc = x_enc.permute(0, 2, 1).contiguous()  
             x_patched, n_vars = self.patching(x_enc) 
             enc_out = self.patch_projection(x_patched)
-            cluster_probs, ts_embedding, ts_pi, ts_A, entropy_loss = self.ts_cluster(enc_out,text_pi,text_A)
+            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, log_pi, log_A)
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs) 
-            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  
+            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state[:, -self.valid_patch:, :]  
             # dec_out = self.ts_llm_fusion(ts_embedding, dec_out, dec_out)
             dec_out = self.projection(dec_out)  
             # dec_out = self.projection(torch.cat([dec_out, ts_embedding], dim=-1))  

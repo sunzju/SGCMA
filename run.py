@@ -12,7 +12,7 @@ import os
 import logging
 from models import SGCMA
 from data_provider.data_factory import data_provider
-from utils.tools import text_data_provider, remap_tokens_to_local_vocab, del_files, EarlyStopping, adjust_learning_rate, vali
+from utils.tools import text_data_provider, remap_tokens_to_local_vocab, del_files, EarlyStopping, adjust_learning_rate, vali, logging_vali_result
 import seaborn as sns
 import matplotlib.pyplot as plt
 # change something
@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument('--model_comment', type=str, default='none', help='prefix when saving test results')
     parser.add_argument('--model', type=str, default='Mymodel',
                         help='model name, options: [Autoformer, DLinear, Mymodel]')
-    parser.add_argument('--device', type=str, default='cuda:0', help='device')
+
 
     # wikihmm
     parser.add_argument('--sentences_path', type=str, default='wikidata/sentences_35.h5', help='wiki_sentences file')
@@ -81,9 +81,9 @@ def parse_args():
     parser.add_argument('--checkpoints', type=str, default='checkpoints', help='location of model checkpoints')
 
     # forecasting task
-    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
+    parser.add_argument('--seq_len', '-sl', type=int, default=336, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
     parser.add_argument('--label_len', type=int, default=0, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+    parser.add_argument('--pred_len', '-pl', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 
     # model define
@@ -94,37 +94,39 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
-    parser.add_argument('--stride', type=int, default=8, help='stride')
+    parser.add_argument('--stride', type=int, default=16, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
 
     parser.add_argument('--seed', type=int, default=2025, help='random seed')
-    parser.add_argument('--d_model', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
-    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
-    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
-    parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
-    parser.add_argument('--temperature', type=float, default=1.0, help='temperature')
-    parser.add_argument('--cluster_num', type=int, default=32, help='cluster number')
-    parser.add_argument('--topk', type=int, default=512, help='topk')
-    parser.add_argument('--topkmode', type=str, default='select', help='select or all')
-    parser.add_argument('--loss_mode', type=str, default='mse+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
-    parser.add_argument('--hmm_reg', type=float, default=0.1, help='hmm regularization')
-    parser.add_argument('--entropy_reg', type=float, default=1, help='entropy regularization')
-    parser.add_argument('--hmm_pretrained_flag', type=int, default=1, help='is pretrain')
-    parser.add_argument('--hmm_pretrain_mode', type=str, default='ll', help='ll+diag+entropy')
-    parser.add_argument('--load_hmm_flag', type=int, default=1, help='is load hmm')
-    parser.add_argument('--linear_layer', type=int, default=1, help='linear layer')
-    parser.add_argument('--diag_max', type=float, default=0.7, help='diag max')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='optimizer learning rate')
-    parser.add_argument('--eval_interval_iters', type=int, default=100, help='max epochs')
+    parser.add_argument('--d_model', '-dm', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
+    parser.add_argument('--n_heads', '-nh', type=int, default=8, help='num of heads')
+    parser.add_argument('--e_layers', '-el', type=int, default=2, help='num of encoder layers')
+    parser.add_argument('--d_ff', '-df', type=int, default=32, help='dimension of fcn')
+    parser.add_argument('--temperature', '-tp', type=float, default=1.0, help='temperature')
+    parser.add_argument('--cluster_num', '-cn', type=int, default=100, help='cluster number')
+    parser.add_argument('--topk', '-tk', type=int, default=128, help='topk')
+    parser.add_argument('--topkmode', '-tkm', type=str, default='select', help='select or all')
+    parser.add_argument('--loss_mode', '-lm', type=str, default='mae+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
+    parser.add_argument('--hmm_reg', '-hr', type=float, default=0.1, help='hmm regularization')
+    parser.add_argument('--entropy_reg', '-er', type=float, default=1, help='entropy regularization')
+    parser.add_argument('--hmm_pretrained_flag', '-hpf', type=int, default=1, help='is pretrain')
+    parser.add_argument('--hmm_pretrain_mode', '-hpm', type=str, default='ll', help='ll+diag+entropy')
+    parser.add_argument('--load_hmm_flag', '-lh',  type=int, default=1, help='is load hmm')
+    parser.add_argument('--linear_layer', '-ll', type=int, default=1, help='linear layer')
+    parser.add_argument('--diag_max', '-dmx', type=float, default=0.7, help='diag max')
+    parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4, help='optimizer learning rate')
+    parser.add_argument('--eval_interval_iters', '-eii', type=int, default=100, help='max epochs')
+    parser.add_argument('--load_checkpoint', '-lc', type=int, default=0, help='load checkpoint')
+    parser.add_argument('--batch_size', '-bs', type=int, default=128, help='batch size of train input data')
+    parser.add_argument('--device', type=str, default='cuda:3', help='device')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
-    parser.add_argument('--pretrain_epochs', type=int, default=2, help='pretrain hmm epochs')
-    parser.add_argument('--batch_size', type=int, default=256, help='batch size of train input data')
-    parser.add_argument('--eval_batch_size', type=int, default=256, help='batch size of model evaluation')
+    parser.add_argument('--pretrain_epochs', '-pe', type=int, default=2, help='pretrain hmm epochs')
+    parser.add_argument('--eval_batch_size', '-ebs', type=int, default=32, help='batch size of model evaluation')
 
     parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
     parser.add_argument('--des', type=str, default='test', help='exp description')
@@ -159,10 +161,10 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
             args.seq_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer)
+            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -186,21 +188,25 @@ def main():
         model_optim = optim.Adam(trained_parameters, lr=args.learning_rate)
 
         # 损失函数
-        criterion = nn.MSELoss()
+        mse_metric = nn.MSELoss()
         mae_metric = nn.L1Loss()
 
-        checkpoint_path = os.path.join(check_pth, 'checkpoint')
-        if os.path.exists(checkpoint_path):
-            try:
-                print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
-                checkpoint = torch.load(checkpoint_path, map_location=device)
-                model.load_state_dict(checkpoint, strict=False)  # 加载模型状态
-                print(f"Loaded from {checkpoint_path}")
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}")
-                print("No checkpoint found. Starting Phase 1 from scratch.")    
+        if args.load_checkpoint:
+
+            checkpoint_path = os.path.join(check_pth, 'checkpoint')
+            if os.path.exists(checkpoint_path):
+                try:
+                    print(f"Found checkpoint at {checkpoint_path}. Resuming Phase 1 training.")
+                    checkpoint = torch.load(checkpoint_path, map_location=device)
+                    model.load_state_dict(checkpoint, strict=False)  # 加载模型状态
+                    print(f"Loaded from {checkpoint_path}")
+                except Exception as e:
+                    print(f"Error loading checkpoint: {e}")
+                    print("No checkpoint found. Starting Phase 1 from scratch.")    
+            else:
+                print("No checkpoint found. Starting from scratch.")  
         else:
-            print("No checkpoint found. Starting from scratch.")        
+            print("No checkpoint found. Starting from scratch.")  
 
         _, text_dataloader = text_data_provider(args)
 
@@ -260,14 +266,13 @@ def main():
         print("Starting Phase 2: Joint training")
         best_test_mse = float('inf')
         best_vali_mse = float('inf')
+        best_test_mae = float('inf')
+        best_vali_mae = float('inf')
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
                 break
             model.train()
-            train_loss = 0.0         # 总损失
-            train_hmm_loss = 0.0     # text的极大似然损失
-            train_entropy_loss = 0.0 # ts聚类的熵损失            
-            train_mseloss = 0.0      # ts的mse损失
+            train_loss, train_hmm_loss, train_entropy_loss, train_mseloss, train_maeloss = 0.0, 0.0, 0.0, 0.0, 0.0
             epoch_time = time.time()
             model_optim.zero_grad()
             # zip 将两个 DataLoader 的迭代器配对，同步迭代.  对于zip两个Dataloader同步迭代，使用tqdm包装，total总长度需要显式地写出来。单个DataLoader时不需要
@@ -293,7 +298,8 @@ def main():
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                mseloss = criterion(outputs, batch_y)
+                mseloss = mse_metric(outputs, batch_y)
+                maeloss = mae_metric(outputs, batch_y)
 
                 # total_loss = mseloss + hmm_loss + entropy_loss
                 loss = 0
@@ -303,6 +309,8 @@ def main():
                     loss += args.hmm_reg * likelihood_loss
                 if 'entropy' in args.loss_mode:
                     loss += args.entropy_reg * entropy_loss
+                if 'mae' in args.loss_mode:
+                    loss += maeloss
 
                 model_optim.zero_grad()
                 loss.backward()
@@ -312,40 +320,33 @@ def main():
                 train_hmm_loss += likelihood_loss.cpu().detach().item()
                 train_mseloss += mseloss.cpu().detach().item()
                 train_entropy_loss += entropy_loss.cpu().detach().item()
-                
+                train_maeloss += maeloss.cpu().detach().item()
+
                 torch.cuda.empty_cache()
 
                 pbar.set_postfix({
                     'mse': mseloss.cpu().detach().item(),  
                     'entropy_loss': entropy_loss.cpu().detach().item(),                     
-                    'hmm_loss': likelihood_loss.cpu().detach().item()
+                    'hmm_loss': likelihood_loss.cpu().detach().item(),
+                    'mae': maeloss.cpu().detach().item()
                 })
 
                 if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1:
-                    # torch.save(model.wiki_hmm.init_logits, os.path.join('pretrain_model/vali', 'epoch_init_logits.pt'))
-                    # torch.save(model.wiki_hmm.transition_logits, os.path.join('pretrain_model/vali', 'epoch_transition_logits.pt'))
-                    # torch.save(model.wiki_hmm.emission_logits, os.path.join('pretrain_model/vali', 'epoch_emission_logits.pt'))
-                    vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, criterion, mae_metric)
-                    test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, criterion, mae_metric)
-                    print('')
-                    if vali_mseloss < best_vali_mse:
-                        best_vali_mse = vali_mseloss
-                    if test_mseloss < best_test_mse:
-                        best_test_mse = test_mseloss
-                    logger.info(f"Epoch {epoch + 1}/{batch_idx + 1} | V MSE Loss: {vali_mseloss:.7f} | T MSE Loss: {test_mseloss:.7f} | "
-                  f"T MAE Loss: {test_mae_loss:.7f} | Best V MSE: {best_vali_mse:.7f} | Best T MSE: {best_test_mse:.7f}")
-                    early_stopping(vali_mseloss, model, check_pth)
+                    vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
+                    test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
+                    best_vali_mse, best_vali_mae, best_test_mse, best_test_mae = logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth)
+
                     if early_stopping.early_stop:
                         logger.info("Early stopping")
                         break
 
-                # print(f"mse: {train_mseloss / (batch_idx + 1)}, entropy_loss: {train_entropy_loss / (batch_idx + 1)}, hmm_loss: {train_hmm_loss / (batch_idx + 1)}", end='\r')
            
 
             logger.info(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
                   f"HMM Loss: {train_hmm_loss / len(train_loader):.7f} | "
                   f"MSE Loss: {train_mseloss / len(train_loader):.7f} | "
-                  f"Entropy Loss: {train_entropy_loss / len(train_loader):.7f} ")
+                  f"Entropy Loss: {train_entropy_loss / len(train_loader):.7f} | "
+                  f"MAE Loss: {train_maeloss / len(train_loader):.7f} ")
 
 
 
