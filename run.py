@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument('--loss_mode', '-lm', type=str, default='mae', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
     parser.add_argument('--hmm_reg', '-hr', type=float, default=0.1, help='hmm regularization')
     parser.add_argument('--entropy_reg', '-er', type=float, default=1, help='entropy regularization')
-    parser.add_argument('--hmm_pretrained_flag', '-hpf', type=int, default=1, help='is pretrain')
+    parser.add_argument('--hmm_pretrained_flag', '-hpf', type=int, default=1, help='1:  hmm is pretrained, there is no need to pretrain the hmm, 0: need to pretrain the hmm')
     parser.add_argument('--hmm_pretrain_mode', '-hpm', type=str, default='ll', help='ll+diag+entropy')
     parser.add_argument('--load_hmm_flag', '-lh',  type=int, default=1, help='is load hmm')
     parser.add_argument('--linear_layer', '-ll', type=int, default=1, help='linear layer')
@@ -118,10 +118,10 @@ def parse_args():
     parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4, help='optimizer learning rate')
     parser.add_argument('--eval_interval_iters', '-eii', type=int, default=-1, help='max epochs')
     parser.add_argument('--load_checkpoint', '-lc', type=int, default=0, help='load checkpoint')
-    parser.add_argument('--batch_size', '-bs', type=int, default=32, help='batch size of train input data')
+    parser.add_argument('--batch_size', '-bs', type=int, default=256, help='batch size of train input data')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
-    parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
-    parser.add_argument('--fully_trainable_trans', '-ftt', type=int, default=1, help='train transition matrix')
+    parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length') 
+    parser.add_argument('--fully_trainable_trans', '-ftt', type=int, default=1, help='1: train the fully trainable transition matrix and initial prob in ts_aligner using the pre-trained hmm param as initial value')
 
 
     # optimization
@@ -161,20 +161,21 @@ def main():
     for gpt2_id, local_id in gpt2_to_local_id.items():
         gpt2_to_local[gpt2_id] = local_id  # [50256,], 没出现的id是-1
     gpt2_to_local = gpt2_to_local.to(device)
-
+    setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}_ftt{}'.format(
+        args.task_name, args.model_id, args.model, args.data, args.features,
+        args.seq_len, args.pred_len, args.d_model, args.n_heads,
+        args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size, args.fully_trainable_trans)
+    logger = makeup_logging(setting)
+    logger.info(setting)
+    
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}_ftt{}'.format(
-            args.task_name, args.model_id, args.model, args.data, args.features,
-            args.seq_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size, args.fully_trainable_trans)
-        print(setting)
-        logger = makeup_logging(setting)
+
 
         # 加载 ts dataset 和 ts dataloader
-        train_data, train_loader = data_provider(args, 'train') 
-        vali_data, vali_loader = data_provider(args, 'val')
-        test_data, test_loader = data_provider(args, 'test')
+        _, ts_loader = data_provider(args, 'train') 
+        _, vali_loader = data_provider(args, 'val')
+        _, test_loader = data_provider(args, 'test')
 
         """ 初始化模型, 创建类的实例时, 会自动调用其__init__方法, __init__方法中的代码会按顺序执行。"""
         model = SGCMA.Model(args).float().to(device)
@@ -223,6 +224,7 @@ def main():
                 print(f"Pretrained HMM found at {pretrain_hmm_path}.")
                 full_model_state = torch.load(pretrain_hmm_path, map_location=device)
                 model.wiki_hmm.load_state_dict(full_model_state)
+                print(f"Loaded HMM checkpoint from {pretrain_hmm_path}")
 
         if not args.hmm_pretrained_flag:
             # === Phase 1: Train text HMM for 5 epochs ===
@@ -232,7 +234,7 @@ def main():
                 epoch_time = time.time()
                 epoch_loss = 0.0
                 iter_text_dataloader = iter(text_dataloader)
-                with tqdm(range(len(text_dataloader)), desc=f"Text Epoch {epoch + 1}") as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
+                with tqdm(range(len(text_dataloader)), desc=f"Text Epoch {epoch + 1}", mininterval=0.5) as pbar:   # pbar 是 tqdm 包装后的 dataloader，仍然是一个可迭代对象
                     for batch_idx in pbar:
                         sentences = next(iter_text_dataloader)
                         sentences = sentences.to(device)
@@ -275,8 +277,14 @@ def main():
         best_vali_mae = float('inf')
         if args.fully_trainable_trans and not check_load_flag:
             model._init_trans_pi()
+            print("Initialized transition matrix and initial probability")
+        else:
+            print("Not initialized transition matrix and initial probability")
         if not model.ems_trainable_while_joint:
             model._cal_archive_topk()
+            print("Calculated archive topk, and this value will not be updated in the joint training phase")
+        else:
+            print("Not calculated archive topk, and this value will be updated in the joint training phase")
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
                 break
@@ -284,14 +292,14 @@ def main():
             train_loss, train_hmm_loss, train_entropy_loss, train_mseloss, train_maeloss = 0.0, 0.0, 0.0, 0.0, 0.0
             epoch_time = time.time()
             model_optim.zero_grad()
-            # zip 将两个 DataLoader 的迭代器配对，同步迭代.  对于zip两个Dataloader同步迭代，使用tqdm包装，total总长度需要显式地写出来。单个DataLoader时不需要
-            pbar = tqdm(range(len(train_loader)), desc=f"Train Epoch {epoch + 1}", total=len(train_loader))
-            iter_train_loader = iter(train_loader)
+           
+            pbar = tqdm(range(len(ts_loader)), desc=f"Train Epoch {epoch + 1}", total=len(ts_loader), mininterval=0.5)
+            iter_ts_loader = iter(ts_loader)
             iter_text_dataloader = iter(text_dataloader)
 
             for batch_idx in pbar:
 
-                ts_batch = next(iter_train_loader)
+                ts_batch = next(iter_ts_loader)
                 text_batch = next(iter_text_dataloader)
                 batch_x, batch_y, _, _ = ts_batch
                 batch_x = batch_x.float().to(device)
@@ -333,7 +341,6 @@ def main():
                 train_entropy_loss += entropy_loss.cpu().detach().item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss
                 train_maeloss += maeloss.cpu().detach().item()
 
-                # torch.cuda.empty_cache()
 
                 pbar.set_postfix({
                     'mse': mseloss.cpu().detach().item(),  
@@ -343,26 +350,26 @@ def main():
                 })
 
                 if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1 and args.eval_interval_iters != -1:
-                    vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
-                    test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
+                    vali_mseloss, vali_mae_loss = vali(args, model, None, vali_loader, mse_metric, mae_metric)
+                    test_mseloss, test_mae_loss = vali(args, model, None, test_loader, mse_metric, mae_metric)
                     best_vali_mse, best_vali_mae, best_test_mse, best_test_mae = logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth)
 
 
-
+            pbar.close()
            
             if args.eval_interval_iters == -1:
-                vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
-                test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
+                vali_mseloss, vali_mae_loss = vali(args, model, None, vali_loader, mse_metric, mae_metric)
+                test_mseloss, test_mae_loss = vali(args, model, None, test_loader, mse_metric, mae_metric)
                 best_vali_mse, best_vali_mae, best_test_mse, best_test_mae = logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth)
                 if early_stopping.early_stop:
                     logger.info("Early stopping")
                     break
 
-            logger.info(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
-                  f"HMM Loss: {train_hmm_loss / len(train_loader):.7f} | "
-                  f"MSE Loss: {train_mseloss / len(train_loader):.7f} | "
-                  f"Entropy Loss: {train_entropy_loss / len(train_loader):.7f} | "
-                  f"MAE Loss: {train_maeloss / len(train_loader):.7f} ")
+            logger.info(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(ts_loader):.7f} | "
+                  f"HMM Loss: {train_hmm_loss / len(ts_loader):.7f} | "
+                  f"MSE Loss: {train_mseloss / len(ts_loader):.7f} | "
+                  f"Entropy Loss: {train_entropy_loss / len(ts_loader):.7f} | "
+                  f"MAE Loss: {train_maeloss / len(ts_loader):.7f} ")
 
 
 

@@ -156,7 +156,7 @@ def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric
 
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, _, _) in tqdm(enumerate(vali_loader)):
+        for i, (batch_x, batch_y, _, _) in enumerate(vali_loader):
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
             # batch_x_mark = batch_x_mark.float().to(device)
@@ -181,6 +181,7 @@ def vali(args, model: SGCMA.Model, vali_data, vali_loader, criterion, mae_metric
             
             total_mseloss += mseloss.cpu().detach().item()
             total_mae_loss += mae_loss.cpu().detach().item()
+            print(f"[{i}/{len(vali_loader)}]", end="\r")
     
     total_mseloss = total_mseloss / len(vali_loader)
     total_mae_loss = total_mae_loss / len(vali_loader)

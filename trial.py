@@ -1,145 +1,171 @@
+import torchvision
+torchvision.disable_beta_transforms_warning()
+import argparse
 import torch
+from torch import nn, optim
+import torch.nn.functional as F
+from tqdm import tqdm
+import time
+import random
+import numpy as np
+import os
+import logging
+from models import SGCMA
+from data_provider.data_factory import data_provider
+from utils.tools import text_data_provider, remap_tokens_to_local_vocab, del_files, EarlyStopping, adjust_learning_rate, vali, logging_vali_result
+import seaborn as sns
+import matplotlib.pyplot as plt
+from models.SGCMA import WikiHMM
+# change something
+
+def makeup_logging(logging_file_nm):
+    # # 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
+    log_dir = "log"  
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, logging_file_nm)  
+    # 自定义 Logger
+    logger = logging.getLogger('SGCMA_Training')
+    logger.setLevel(logging.DEBUG)  # 设置全局最低级别为 DEBUG
+    # 日志格式
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    # 文件 Handler：输出 DEBUG 及以上到文件
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)  # 文件记录 DEBUG 及以上
+    file_handler.setFormatter(formatter)
+    # 控制台 Handler：仅输出 INFO 及以上
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)  
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+"""环境变量"""
+os.environ['CURL_CA_BUNDLE'] = ''  # 禁用 SSL 证书验证
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"  # 设置 PyTorch 内存分配策略
 
 
-def kl_multivariate_normal(mu0, sigma0, mu1, sigma1):  
-    """  
-    计算两个多元高斯分布 N(mu0, sigma0) 与 N(mu1, sigma1) 的 KL 散度  
-    mu0, mu1:      (..., d)       均值向量  
-    sigma0, sigma1:(..., d, d)    协方差矩阵（必须对称正定）  
+def parse_args():
+    parser = argparse.ArgumentParser(description='SGCMA')
 
-    返回:           (...)          KL散度  
-    """  
-    d = mu0.shape[-1]  
-
-    # 计算 Sigma1 的逆与对数行列式，Sigma0 的对数行列式  
-    inv_sigma1 = torch.linalg.inv(sigma1)  
-    logdet_sigma0 = torch.linalg.slogdet(sigma0)[1]  
-    logdet_sigma1 = torch.linalg.slogdet(sigma1)[1]  
-
-    # 第一项 tr(Sigma1^-1 Sigma0)  
-    trace_term = torch.einsum('...ij,...jk->...ik', inv_sigma1, sigma0).diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)  
-
-    # 第二项 (mu1-mu0)^T Sigma1^-1 (mu1-mu0)  
-    diff = (mu1 - mu0)[..., None]          # (..., d, 1)  
-    mahalanobis = torch.matmul(torch.matmul(diff.transpose(-2,-1), inv_sigma1), diff).squeeze(-1).squeeze(-1)  
-
-    # KL公式汇总  
-    kl = 0.5 * (trace_term + mahalanobis - d + logdet_sigma1 - logdet_sigma0)  
-    return kl  
-def compute_metrics(out_logits, targets):
-    out_labels = torch.argmax(out_logits, dim=1)
-    num_classes = out_logits.size(-1)
-    precision_list = []
-    recall_list = []
-    f1_list = []
-    accuracy_list = []
-    for c in range(num_classes):
-        true_positives = torch.sum((out_labels == targets) & (targets == c))
-        predicted_positives = torch.sum(out_labels == c)
-        actual_positives = torch.sum(targets == c)
-
-        precision = true_positives.float() / predicted_positives if predicted_positives else 0
-        recall = true_positives.float() / actual_positives if actual_positives else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
-        accuracy = true_positives.float() / actual_positives if actual_positives else 0
-
-        precision_list.append(precision)
-        recall_list.append(recall)
-        f1_list.append(f1)
-        accuracy_list.append(accuracy)
-    precision = torch.mean(torch.tensor(precision_list))
-    recall = torch.mean(torch.tensor(recall_list))
-    f1 = torch.mean(torch.tensor(f1_list))
-    accuracy = torch.mean(torch.tensor(accuracy_list))
-    return precision, recall, f1, accuracy
+    # basic config
+    parser.add_argument('--task_name', type=str, default='long_term_forecast',
+                        help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
+    parser.add_argument('--is_training', type=int, default=1, help='status')
+    parser.add_argument('--model_id', type=str, default='test', help='model id')
+    parser.add_argument('--model_comment', type=str, default='none', help='prefix when saving test results')
+    parser.add_argument('--model', type=str, default='Mymodel',
+                        help='model name, options: [Autoformer, DLinear, Mymodel]')
 
 
-def KL_local_global(T_o_local, T2_o_local, T_n_local, T2_n_local, T_o_other_sum, T2_o_other_sum, T_n_other, T2_n_other, sample_num_local, sample_num_class_others):
-    """
-    ::param T_o_local: [num_classes, z_o_dim]
-    ::param T2_o_local: [num_classes, z_o_dim, z_o_dim]
-    ::param T_n_local: [z_n_dim]
-    ::param T2_n_local: [z_n_dim, z_n_dim]
-    ::param T_o_other_sum: [num_classes, z_o_dim]
-    ::param T2_o_other_sum: [num_classes, z_o_dim, z_o_dim]
-    ::param T_n_other: [client_num-1, z_n_dim]
-    ::param T2_n_other: [client_num-1, z_n_dim, z_n_dim]
-    ::param sample_num_local: [num_classes] 本地每个类别的样本数量
-    ::param sample_num_class_others: [client_num-1, num_classes] 其他客户端每个类别的样本数量
-    """
+    # wikihmm
+    parser.add_argument('--sentences_path', type=str, default='wikidata/sentences_35.h5', help='wiki_sentences file')
+    parser.add_argument('--unique_tokens_path', type=str, default='wikidata/tokens_35.pkl', help='unique tokens file')
+    parser.add_argument('--pretrain_hmm_path', type=str, default='wikidata', help='save_pretrain_hmm_path')
+    parser.add_argument('--hidden_state_num', type=int, default=100, help='hmm hidden_state_num')
+    parser.add_argument('--colsum_threshold', type=float, default=0.2, help='hidden_state arrived lower bound logits')
+    parser.add_argument('--text_batch_size', type=int, default=1024, help='batch size of wikipedia data')
+    parser.add_argument('--vocab_size', type=int, default=50256, help='vocab size')
 
-    num_classes = len(T_o_local)
-    z_o_dim = T_o_local.size(1)
-    z_n_dim = T_n_local.size(0)
-    client_num = len(T_n_other)
-    sample_num_others = sample_num_class_others.sum(dim=0)
-    sample_nums = sample_num_local + sample_num_others
-    T_o = (T_o_local + T_o_other_sum) / sample_nums.unsqueeze(1)
-    T2_o = (T2_o_local + T2_o_other_sum) / sample_nums.unsqueeze(1).unsqueeze(2)
+    # ts data loader
+    parser.add_argument('--data', type=str, default='ETTh1', help='datasets type')
+    parser.add_argument('--root_path', type=str, default='dataset/ETT-small', help='root path of the data file')
+    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
+    parser.add_argument('--features', type=str, default='M',
+                        help='forecasting task, options:[M, S, MS]; '
+                             'M:multivariate predict multivariate, S: univariate predict univariate, '
+                             'MS:multivariate predict univariate')
+    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
+    parser.add_argument('--freq', type=str, default='h',
+                        help='freq for time features encoding, '
+                             'options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly]')
+    parser.add_argument('--checkpoints', type=str, default='checkpoints', help='location of model checkpoints')
 
-    mu_o = T_o
-    Sigma_o = T2_o - T_o.unsqueeze(2) @ T_o.unsqueeze(1) 
-    # Sigma_o = Sigma_o + 1e-6 * torch.eye(z_o_dim)
-    # Sigma_o_inv = torch.linalg.inv(Sigma_o)
-    # log_det_Sigma_o = torch.slogdet(Sigma_o)[0]
+    # forecasting task
 
-    # tr_Sigma2_inv_Simga_1 = torch.einsum('mcd,ndf->mncf', Sigma_o_inv, Sigma_o).diagonal(offset=0, dim1=-1, dim2=-2).sum(-1) # [m, n, c, f] -> [m, n]
-    # mu2_mu1 = mu_o.unsqueeze(1) - mu_o.unsqueeze(0) # [m, n, d]
+    parser.add_argument('--label_len', type=int, default=0, help='start token length')
+    parser.add_argument('--pred_len', '-pl', type=int, default=96, help='prediction sequence length')
+    parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 
-    # mu2_mu1_T_Simga2_inv = torch.einsum('mnd,mdc->mnc', mu2_mu1, Sigma_o_inv) # [m, n, c]
-    # mu2_mu1_T_Simga2_inv_mu2_mu1 = torch.einsum('mnc,mnc->mn', mu2_mu1_T_Simga2_inv, mu2_mu1) # [m, n]
+    # model define
+    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
+    parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
+    parser.add_argument('--c_out', type=int, default=7, help='output size')
+    parser.add_argument('--embed', type=str, default='timeF', help='time features encoding, options:[timeF, fixed, learned]')
+    parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
+    parser.add_argument('--activation', type=str, default='gelu', help='activation')
+    parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+    parser.add_argument('--stride', type=int, default=8, help='stride')
+    parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
+    parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
 
-    # log_det_Sigma1_log_det_Sigma2 = log_det_Sigma_o.unsqueeze(0) - log_det_Sigma_o.unsqueeze(1)
-
-    # interclass_kl_sum = 0.5 * (tr_Sigma2_inv_Simga_1 +mu2_mu1_T_Simga2_inv_mu2_mu1 + log_det_Sigma1_log_det_Sigma2 - num_classes)
-
-    # mask = 1 - torch.eye(num_classes)
-    # interclass_kl_sum = interclass_kl_sum * mask.unsqueeze(-1)
-    # inter_clas_kl_loss = torch.sum(interclass_kl_sum) / (num_classes*(num_classes-1))
-
-    inter_clas_kl_loss = 0
-    for c in range(num_classes):
-        mu_o_c = mu_o[c]
-        Sigma_o_c = Sigma_o[c]
-        for c_other in range(num_classes):
-            if c == c_other:
-                continue
-            mu_o_c_other = mu_o[c_other]
-            Sigma_o_c_other = Sigma_o[c_other]
-            kl_loss = kl_multivariate_normal(mu_o_c, Sigma_o_c, mu_o_c_other, Sigma_o_c_other)
-            inter_clas_kl_loss += kl_loss
-
-    return inter_clas_kl_loss/(num_classes*(num_classes-1))
-
-
-if __name__ == "__main__":
-    num_class = 10
-    feature_dim = 1024
-    client_num = 5
-    sample_num_local = torch.ones(num_class).cuda() * 32
-    sample_num_class_others = torch.ones(client_num-1, num_class).cuda() * 32
-
-    zo = torch.randn(num_class, 32, feature_dim).cuda() 
-    zo2 = zo[:, :, :, None] @ zo[:, :, None, :]
+    parser.add_argument('--seed', type=int, default=2021, help='random seed')
+    parser.add_argument('--d_model', '-dm', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
+    parser.add_argument('--n_heads', '-nh', type=int, default=8, help='num of heads')
+    parser.add_argument('--e_layers', '-el', type=int, default=2, help='num of encoder layers')
+    parser.add_argument('--d_ff', '-df', type=int, default=32, help='dimension of fcn')
+    parser.add_argument('--temperature', '-tp', type=float, default=0.25, help='temperature')
+    parser.add_argument('--cluster_num', '-cn', type=int, default=100, help='cluster number')
+    parser.add_argument('--topk', '-tk', type=int, default=1000, help='topk')
+    parser.add_argument('--topkmode', '-tkm', type=str, default='select', help='select or all')
+    parser.add_argument('--loss_mode', '-lm', type=str, default='mae', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
+    parser.add_argument('--hmm_reg', '-hr', type=float, default=0.1, help='hmm regularization')
+    parser.add_argument('--entropy_reg', '-er', type=float, default=1, help='entropy regularization')
+    parser.add_argument('--hmm_pretrained_flag', '-hpf', type=int, default=1, help='1:  hmm is pretrained, there is no need to pretrain the hmm, 0: need to pretrain the hmm')
+    parser.add_argument('--hmm_pretrain_mode', '-hpm', type=str, default='ll', help='ll+diag+entropy')
+    parser.add_argument('--load_hmm_flag', '-lh',  type=int, default=1, help='is load hmm')
+    parser.add_argument('--linear_layer', '-ll', type=int, default=1, help='linear layer')
+    parser.add_argument('--diag_max', '-dmx', type=float, default=0.7, help='diag max')
+    parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4, help='optimizer learning rate')
+    parser.add_argument('--eval_interval_iters', '-eii', type=int, default=-1, help='max epochs')
+    parser.add_argument('--load_checkpoint', '-lc', type=int, default=1, help='load checkpoint')
+    parser.add_argument('--batch_size', '-bs', type=int, default=32, help='batch size of train input data')
+    parser.add_argument('--device', type=str, default='cuda:0', help='device')
+    parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length') 
+    parser.add_argument('--fully_trainable_trans', '-ftt', type=int, default=1, help='1: train the fully trainable transition matrix and initial prob in ts_aligner using the pre-trained hmm param as initial value')
 
 
+    # optimization
+    parser.add_argument('--num_workers', type=int, default=3, help='data loader num workers')
+    parser.add_argument('--itr', type=int, default=1, help='experiments times')
+    parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
+    parser.add_argument('--pretrain_epochs', '-pe', type=int, default=2, help='pretrain hmm epochs')
+    parser.add_argument('--eval_batch_size', '-ebs', type=int, default=32, help='batch size of model evaluation')
 
-    T_o_local = zo.sum(dim=-2).cuda()
-    T2_o_local = zo2.sum(dim=-3).cuda()
-    T_n_local = torch.randn(feature_dim).cuda()
-    T2_n_local = torch.randn(feature_dim, feature_dim).cuda()
-    T_o_other_sum = T_o_local * (client_num-1)
-    T2_o_other_sum = T2_o_local * (client_num-1)
-    T_n_other = torch.randn(client_num-1, feature_dim).cuda()
-    T2_n_other = torch.randn(client_num-1, feature_dim, feature_dim).cuda()
+    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
+    parser.add_argument('--des', type=str, default='test', help='exp description')
+    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
+    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
+    parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
+    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
+    parser.add_argument('--llm_layers', type=int, default=6)
+    parser.add_argument('--percent', type=int, default=100)
+    
+    return parser.parse_args()
 
-    inter_clas_kl_loss = KL_local_global(T_o_local, T2_o_local, T_n_local, T2_n_local, T_o_other_sum, T2_o_other_sum, T_n_other, T2_n_other, sample_num_local, sample_num_class_others)
-    print(inter_clas_kl_loss)
-    # d = 3  
-    # mu0 = torch.zeros(d)  
-    # sigma0 = torch.eye(d)  
-    # mu1 = torch.zeros(d)  
-    # sigma1 = torch.eye(d)  
 
-    # kl = kl_multivariate_normal(mu0, sigma0, mu1, sigma1)  
-    # print(f"KL 散度结果：{kl:.4f}")  
+    # 设置随机种子
+    
+    
+
+    
+
+
+if __name__ == '__main__':
+    
+    args = parse_args()
+
+    hmm_model = WikiHMM(100, diag_max=0.7).cuda()
+    init_logits = torch.load('hmm/init_logits.pt')
+    transition_logits = torch.load('hmm/transition_logits.pt')
+    emission_logits = torch.load('hmm/emission_logits.pt')
+
+    hmm_model.init_logits.data = init_logits.data
+    hmm_model.transition_logits.data = transition_logits.data
+    hmm_model.emission_logits.data = emission_logits.data
+
+    torch.save(hmm_model.state_dict(), 'checkpoints/hmm_100_ll_checkpoint.pth')
+
+    # print(hmm_model.init_logits.data)
+    
+    
