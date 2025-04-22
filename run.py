@@ -121,7 +121,7 @@ def parse_args():
     parser.add_argument('--batch_size', '-bs', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
     parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
-    parser.add_argument('--train_trans', '-tt', type=int, default=1, help='train transition matrix')
+    parser.add_argument('--fully_trainable_trans', '-ftt', type=int, default=1, help='train transition matrix')
 
 
     # optimization
@@ -164,10 +164,10 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}_tt{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}_ftt{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
             args.seq_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size, args.train_trans)
+            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size, args.fully_trainable_trans)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -266,8 +266,6 @@ def main():
                 logger.info(f"Text Epoch {epoch + 1} cost time: {time.time() - epoch_time}")
                 logger.info(f"Text Epoch {epoch + 1} Average Loss: {avg_train_loss:.7f}")
 
-                # 保存当前epoch的模型和状态
-
 
         # === Phase 2: Joint training ===
         print("Starting Phase 2: Joint training")
@@ -275,8 +273,10 @@ def main():
         best_vali_mse = float('inf')
         best_test_mae = float('inf')
         best_vali_mae = float('inf')
-        if args.train_trans and not check_load_flag:
+        if args.fully_trainable_trans and not check_load_flag:
             model._init_trans_pi()
+        if not model.ems_trainable_while_joint:
+            model._cal_archive_topk()
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
                 break
@@ -297,12 +297,14 @@ def main():
                 batch_x = batch_x.float().to(device)
                 batch_y = batch_y.float().to(device)
                 text_batch = text_batch.to(device)
-                
-                text_mapped = remap_tokens_to_local_vocab(text_batch, gpt2_to_local)
+                if not args.fully_trainable_trans:
+                    text_mapped = remap_tokens_to_local_vocab(text_batch, gpt2_to_local)
+                else:
+                    text_mapped = None
 
                 outputs, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = model(
                     batch_x, text_input=text_mapped, is_pretrain=False
-                )  # 但其实只用到了batch_x，其他都没用
+                )  
 
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
@@ -331,7 +333,7 @@ def main():
                 train_entropy_loss += entropy_loss.cpu().detach().item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss
                 train_maeloss += maeloss.cpu().detach().item()
 
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
 
                 pbar.set_postfix({
                     'mse': mseloss.cpu().detach().item(),  

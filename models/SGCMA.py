@@ -87,7 +87,7 @@ class WikiHMM(nn.Module):
         diag_reg = torch.sum(F.relu(torch.diag(torch.exp(log_A)) - self.diag_max).pow(2))
 
 
-        return log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
+        return torch.exp(log_pi), torch.exp(log_A), torch.exp(log_B), likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const
 
 # FlattenHead：展平并输出预测结果
 class FlattenHead(nn.Module):
@@ -172,7 +172,8 @@ class ClusterCenters(nn.Module):
         # 计算每个 patch 到每个聚类中心的平方距离
         mu_diff = (x_expanded - mus_expanded) ** 2   # [B, patch_num, cluster_num, embedding_dim]，这是在embedding上逐个维度的差
         mu_diff = mu_diff.sum(dim=-1)
-        z_p = - mu_diff / self.temperature
+        mu_diff_exp = torch.exp(-mu_diff / self.temperature)  
+        z_p = mu_diff_exp / mu_diff_exp.sum(dim=-1, keepdim=True) # 距离越小概率越大
         return z_p   # [B, patch_num, cluster_num]
 
 class TSCluster(nn.Module):
@@ -186,57 +187,50 @@ class TSCluster(nn.Module):
         super(TSCluster, self).__init__()
         self.cluster_num = cluster_num
         self.patch_num = patch_num
+        self.train_trans = train_trans
 
         """实例化一个 Transformer Encoder: self.bkb"""
         self.bkb = nn.TransformerEncoder(**bkb_kargs)
 
         """实例化 ClusterCenters: self.cluster_centers"""
         self.cluster_centers = ClusterCenters(hidden_dim, cluster_num)
-        self.train_trans = train_trans
-        if train_trans:
-            self.transition_matrix = nn.Parameter(torch.randn(cluster_num, cluster_num))
-            self.init_logits = nn.Parameter(torch.randn(cluster_num))
-    
-    def _init_trans_pi(self, transition_matrix, init_logits):
-        self.transition_matrix.data = transition_matrix
-        self.init_logits.data = init_logits
-    
-    def forward(self, input_series, log_pi=None, log_A=None):   # input_series: [bs*n_vars, patch_num, patch_len]
-        emb_ts = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
-        logits_all = self.cluster_centers(emb_ts)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
 
-        # transform logits to log probability
-        logits_all = logits_all - torch.logsumexp(logits_all, dim=-1, keepdim=True)
+        # 可训练HMM状态转移矩阵、初始状态分布 
+        self.ts_init_logits = nn.Parameter(torch.randn(cluster_num))
+        self.ts_transition_logits = nn.Parameter(torch.randn(cluster_num, cluster_num))
+    
+    def _init_trans_pi(self, init_logits, transition_logits):
+        self.ts_init_logits.data = init_logits
+        self.ts_transition_logits.data = transition_logits
 
+    def forward(self, input_series, init_logits=None, transition_logits=None):   # input_series: [bs*n_vars, patch_num, patch_len]
         if self.train_trans:
-            log_pi = self.init_logits - torch.logsumexp(self.init_logits, dim=0, keepdim=True)
-            log_A = self.transition_matrix - torch.logsumexp(self.transition_matrix, dim=1, keepdim=True)
-
-        log_pi = torch.tile(log_pi, (logits_all.shape[0], 1))  # self.ts_pi 复制到批次大小（B） [bs*n_vars, cluster_num]
+            prob_pi = torch.softmax(self.ts_init_logits, dim=0)
+            prob_A = torch.softmax(self.ts_transition_logits, dim=1)
+        else:
+            prob_pi = torch.softmax(init_logits, dim=0)
+            prob_A = torch.softmax(transition_logits, dim=1)
+        emb_all = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
+        logits_all = self.cluster_centers(emb_all)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
+        logit_t = torch.tile(prob_pi, (logits_all.shape[0], 1))  # self.ts_pi 复制到批次大小（B） [bs*n_vars, cluster_num]
         all_logit_result = []
         # 初始时间步0：直接用初始状态和第一个patch的概率分布
-        log_t = log_pi + logits_all[:, 0]  # 
-        # log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
-        all_logit_result.append(log_t)
+        logit_t = torch.log(logit_t + 1e-10) + torch.log(logits_all[:, 0] + 1e-10)  # 第 2 维（cluster_num）未指定，PyTorch 默认取整个维度，不用写logits_all[:, 0, :]
+        logit_t = torch.softmax(logit_t, dim=1) # 归一化
+        all_logit_result.append(logit_t)
         # 后续时间步
-        for t in range(1, self.patch_num):
-            log_t = (log_t[...,None,:] + log_A.T).sum(dim=-1)  # 计算下一个时间步的隐藏状态分布 (bs*n_vars, cluster_num)
-            log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
-            log_t = log_t + logits_all[:, t]
-            log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
-            all_logit_result.append(log_t)
-        cluster_probs_log = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
-        # cluster_probs_log = cluster_probs_log - torch.logsumexp(cluster_probs_log, dim=-1, keepdim=True)
-        cluster_probs = torch.exp(cluster_probs_log)
-        # cluster_probs = torch.softmax(cluster_probs, dim=-1)
-        entropy_loss_patch_mean = -torch.sum(cluster_probs * cluster_probs_log, dim=-1).mean()
-        
+        for i in range(1, self.patch_num):
+            logit_t = torch.matmul(logit_t, prob_A)  # 计算下一个时间步的隐藏状态分布 (bs*n_vars, cluster_num)
+            logit_t = torch.log(logit_t + 1e-10) + torch.log(logits_all[:, i] + 1e-10) 
+            logit_t = torch.softmax(logit_t, dim=1)  # 归一化
+            all_logit_result.append(logit_t)
+        cluster_probs = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
         # 计算熵损失，鼓励概率分布集中
 
         # mean_prob_each_cluster = torch.mean(cluster_probs, dim=-2)
         # entropy_loss_each_cluster = torch.sum(mean_prob_each_cluster * torch.log(mean_prob_each_cluster + 1e-10), dim=-1).mean()
-        # entropy_loss = entropy_loss_per_patch + entropy_loss_each_cluster
-        return cluster_probs, emb_ts, log_pi, log_A, entropy_loss_patch_mean
+        entropy_loss = -torch.sum(cluster_probs * torch.log(cluster_probs + 1e-10), dim=-1).mean()
+        return cluster_probs, emb_all, prob_pi, prob_A, entropy_loss
 
 
 """将时间序列 patch 与文本 token embeddings 进行 cross-attention 并加权融合, 100个类使用了100个CrossAttentionLayer实例"""
@@ -407,7 +401,14 @@ class Model(nn.Module):
         self.epoch_init_logits = None
         self.epoch_transition_logits = None
         self.epoch_emission_logits = None  # 为vali阶段保存需要的发射矩阵
-        self.train_trans = configs.train_trans
+        self.train_trans = configs.fully_trainable_trans
+        self.topk_token_embeddings_arch = None
+
+        self.ems_trainable_while_joint = True
+
+        if self.train_trans or 'll' not in configs.loss_mode:
+            self.ems_trainable_while_joint = False
+        
 
         # 计算 patch_num，考虑填充
         self.patch_num = (self.seq_len + self.stride - self.patch_len) // self.stride + 1
@@ -459,7 +460,7 @@ class Model(nn.Module):
         self.word_embeddings = self.llm_model.get_input_embeddings().weight  # [50256, d_llm]
 
         # 加载gpt2_to_local_id字典
-        gpt2_to_local_id = torch.load('utils/gpt2_to_local_id.pt', weights_only=False)
+        gpt2_to_local_id = torch.load('hmm/gpt2_to_local_id.pt', weights_only=False)
         # 创建local_to_gpt2映射tensor
         max_local_id = max(gpt2_to_local_id.values())  # 本地token_id的最大值
         self.local_to_gpt2 = torch.zeros(max_local_id + 1, dtype=torch.long, device=self.device)
@@ -487,7 +488,7 @@ class Model(nn.Module):
         """实例化 TSCluster 模块: self.ts_cluster"""
         bkb_kargs = {'encoder_layer': nn.TransformerEncoderLayer(d_model=configs.d_model, nhead=configs.n_heads),
                      'num_layers': configs.e_layers}
-        self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num, train_trans=configs.train_trans)
+        self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num, train_trans=configs.fully_trainable_trans)
 
         """实例化 TSAligner 模块: self.ts_aligner"""
         self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=configs.dropout, temperature=configs.temperature)
@@ -505,8 +506,18 @@ class Model(nn.Module):
         self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout, linear_layer=configs.linear_layer)
         
     def _init_trans_pi(self):
-        self.ts_cluster._init_trans_pi(self.wiki_hmm.transition_logits.data, self.wiki_hmm.init_logits.data)
-    
+        self.ts_cluster._init_trans_pi(self.wiki_hmm.init_logits.data, self.wiki_hmm.transition_logits.data)
+
+    def _cal_archive_topk(self):
+        prob_B = torch.softmax(self.wiki_hmm.emission_logits, dim=1)
+        if self.topkmode == 'select':
+            _, topk_local_indices = torch.topk(prob_B, k = self.topk, dim=1) # [n_cluster, topk]
+            # 直接用tensor索引映射到gpt2_id
+            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
+            self.topk_token_embeddings_arch = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
+        elif self.topkmode == 'all':
+            self.topk_token_embeddings_arch = self.topk_projection(self.local_word_embeddings.T).T + self.embedding_bias[:,None,:] # [n_cluster, topk, d_llm]
+
     def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
         if is_pretrain:
             _, _, _, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const = self.wiki_hmm(text_input)
@@ -514,16 +525,15 @@ class Model(nn.Module):
         else:
             dec_out, likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss = self.forecast(x_enc, text_input)
             return dec_out[:, -self.pred_len:, :], likelihood_loss, transition_entropy_loss, cnct_const, entropy_loss
-    
-        
+
     def forecast(self, x_enc, text_input=None):
         # 训练时
         if text_input is not None:
             """调用 wiki_hmm 模块: self.wiki_hmm"""
             if not self.train_trans:
-                log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
+                prob_pi, prob_A, prob_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
             else:
-                log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = None, None, self.wiki_hmm.emission_logits, 0, 0, 0, None, None
+                prob_pi, prob_A, prob_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = None, None, self.wiki_hmm.emission_logits, 0, 0, 0, None, None
 
             """原始输入 x_enc: [bs, seq_len, n_vars]"""
 
@@ -539,16 +549,19 @@ class Model(nn.Module):
             enc_out = self.patch_projection(x_patched) # [bs*n_vars, patch_num, d_model]
 
             """调用 TSCluster 模块: self.ts_cluster"""
-            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, log_pi, log_A)  # [bs*n_vars, patch_num, cluster_num]
+            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, prob_pi, prob_A)  # [bs*n_vars, patch_num, cluster_num]
 
             """获取topk token embedding for all clusters"""
-            if self.topkmode == 'select':
-                _, topk_local_indices = torch.topk(log_B, k = self.topk, dim=1) # [n_cluster, topk]
-                # 直接用tensor索引映射到gpt2_id
-                topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
-                topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
-            elif self.topkmode == 'all':
-                topk_token_embeddings = self.topk_projection(self.local_word_embeddings.T).T + self.embedding_bias[:,None,:] # [n_cluster, topk, d_llm]
+            if self.ems_trainable_while_joint:
+                if self.topkmode == 'select':
+                    _, topk_local_indices = torch.topk(prob_B, k = self.topk, dim=1) # [n_cluster, topk]
+                    # 直接用tensor索引映射到gpt2_id
+                    topk_gpt2_indices = self.local_to_gpt2[topk_local_indices] # [n_cluster, topk]
+                    topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] # [dictionary_size, d_llm] -> [n_cluster, topk, d_llm]
+                elif self.topkmode == 'all':
+                    topk_token_embeddings = self.topk_projection(self.local_word_embeddings.T).T + self.embedding_bias[:,None,:] # [n_cluster, topk, d_llm]
+            else:
+                topk_token_embeddings = self.topk_token_embeddings_arch
             """调用 TSAligner 模块: self.ts_aligner"""
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs)  # [bs*n_vars, patch_num, d_llm]
             
@@ -577,22 +590,24 @@ class Model(nn.Module):
             logit_A = self.wiki_hmm.transition_logits.detach()
             logit_B = self.wiki_hmm.emission_logits.detach()
 
-            log_pi = logit_pi - torch.logsumexp(logit_A, dim=0, keepdim=True)
-            log_A = logit_A - torch.logsumexp(logit_A, dim=1, keepdim=True)
-            log_B = logit_B - torch.logsumexp(logit_B, dim=1, keepdim=True)
+            # prob_pi = torch.softmax(logit_pi, dim=0)
+            # prob_A = torch.softmax(logit_A, dim=1)
+            # prob_B = torch.softmax(logit_B, dim=1)
 
 
-
-            _, topk_local_indices = torch.topk(log_B, k = self.topk, dim=1)
-            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
-            topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] 
+            if self.ems_trainable_while_joint:
+                _, topk_local_indices = torch.topk(logit_B, k = self.topk, dim=1)
+                topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
+                topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] 
+            else:
+                topk_token_embeddings = self.topk_token_embeddings_arch
 
             x_enc = self.normalize_layers(x_enc, 'norm')  
             B, T, N = x_enc.size()
             x_enc = x_enc.permute(0, 2, 1).contiguous()  
             x_patched, n_vars = self.patching(x_enc) 
             enc_out = self.patch_projection(x_patched)
-            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, log_pi, log_A)
+            cluster_probs, ts_embedding, _, _, entropy_loss = self.ts_cluster(enc_out, logit_pi, logit_A)
             fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs) 
             dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state[:, -self.valid_patch:, :]  
             # dec_out = self.ts_llm_fusion(ts_embedding, dec_out, dec_out)
