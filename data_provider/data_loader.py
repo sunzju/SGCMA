@@ -10,8 +10,9 @@ warnings.filterwarnings('ignore')
 
 
 class Dataset_ETT_hour(Dataset):
-    def __init__(self, root_path, data_path='ETTh1.csv', flag='train', size=None,
-                 features='S', target='OT', scale=True, timeenc=0, freq='h', percent=100,
+    def __init__(self, root_path, flag='train', size=None,
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, timeenc=0, freq='h', percent=100,
                  seasonal_patterns=None):
         if size == None:
             self.seq_len = 24 * 4 * 4
@@ -24,7 +25,7 @@ class Dataset_ETT_hour(Dataset):
         # init
         assert flag in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
-        self.set_type = type_map[flag]   # 0, 1, 2
+        self.set_type = type_map[flag]
 
         self.percent = percent
         self.features = features
@@ -33,6 +34,7 @@ class Dataset_ETT_hour(Dataset):
         self.timeenc = timeenc
         self.freq = freq
 
+        # self.percent = percent
         self.root_path = root_path
         self.data_path = data_path
         self.__read_data__()
@@ -41,7 +43,7 @@ class Dataset_ETT_hour(Dataset):
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1        # 一个数据集一条通道的总样本数
 
     def __read_data__(self):
-        self.scaler = StandardScaler()  # 在特征维度(不是样本)进行归一化，使用 fit 方法计算均值和标准差，使用 transform 方法将数据标准化为标准正态分布
+        self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
 
@@ -51,7 +53,7 @@ class Dataset_ETT_hour(Dataset):
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
-        if self.set_type == 0:  # train
+        if self.set_type == 0:
             border2 = (border2 - self.seq_len) * self.percent // 100 + self.seq_len
 
         if self.features == 'M' or self.features == 'MS':
@@ -60,17 +62,15 @@ class Dataset_ETT_hour(Dataset):
         elif self.features == 'S':
             df_data = df_raw[[self.target]]
 
-        """在训练集上计算均值方差，用其结果标准化全部数据(包括验证集和测试集)"""
         if self.scale:
             train_data = df_data[border1s[0]:border2s[0]]
-            self.scaler.fit(train_data.values)  # 统计量计算结果存储在 self.scaler 中
+            self.scaler.fit(train_data.values)
             data = self.scaler.transform(df_data.values)
         else:
             data = df_data.values
 
-        """df_raw['date'] 是 Pandas DataFrame 的列索引操作，返回一个 Pandas Series 对象，表示 df_raw 中名为 'date' 的列。Pandas 支持将列名作为属性访问, 所以df_raw['date']和df_raw.date是一样的"""
         df_stamp = df_raw[['date']][border1:border2]
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)  # 2016/7/1 00:00 -----> 2016-07-01 00:00:00 ;   dtype: object----> datetime64[ns]
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -87,24 +87,13 @@ class Dataset_ETT_hour(Dataset):
 
 
     def __getitem__(self, index):
-        """
-        index是样本索引, __getitem__()方法会根据这个索引返回对应的数据项, 这里就是seq_x, seq_y, seq_x_mark, seq_y_mark
-        index 通常由 PyTorch 的 DataLoader 自动生成并传递，而不是由用户手动传入.
-        index 范围为 [0, __len__的返回值]
-        sample = dataset[0]  # 相当于调用 dataset.__getitem__(0)
-
-        DataLoader 会根据 dataset.__len__() 返回的样本总数(len(dataset))生成一组索引(0 到 len(dataset) - 1), 并在迭代时自动调用 dataset.__getitem__(index) 来获取数据。
-        """
-        """
-        feat_id: 得到特征通道的索引，因为所有通道的样本数是按序排列的, 所以商是几, 就是从第几个通道提取样本。
-        s_begin: 时间序列的起始位置，表示滑动窗口的开始时间步,余数是几表示从第几个时间步开始
-        """
         feat_id = index // self.tot_len
         s_begin = index % self.tot_len
+
         s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len   # label_len都是0
+        r_begin = s_end - self.label_len
         r_end = r_begin + self.label_len + self.pred_len
-        seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1]  # 只包含第 feat_id 列, 因为切片不包含结束索引
+        seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1]
         seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
@@ -112,7 +101,7 @@ class Dataset_ETT_hour(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
-        return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in  # 每个样本都是单通道
+        return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)

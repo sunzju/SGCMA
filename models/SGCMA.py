@@ -3,95 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import GPT2Config, GPT2Model, GPT2Tokenizer
-from math import sqrt
-import logging
-import os
-import time
-
 from layers.StandardNorm import Normalize
-
-# 配置日志，INFO输出到控制台和文件,DEBUG只输出到文件
-log_dir = "exp2\log"  
-log_file = os.path.join(log_dir, "training.log")  
-# 自定义 Logger
-logger = logging.getLogger('SGCMA_Training')
-logger.setLevel(logging.DEBUG)  # 设置全局最低级别为 DEBUG
-# 日志格式
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-# 文件 Handler：输出 DEBUG 及以上到文件
-file_handler = logging.FileHandler(log_file)
-file_handler.setLevel(logging.DEBUG)  # 文件记录 DEBUG 及以上
-file_handler.setFormatter(formatter)
-# 控制台 Handler：仅输出 INFO 及以上
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)  
-console_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
-
-class WikiHMM(nn.Module):
-    def __init__(self, hidden_state_num, colsum_threshold, token_num=50003):
-        super(WikiHMM, self).__init__()
-        self.hidden_state_num = hidden_state_num
-        self.colsum_threshold = colsum_threshold  
-
-        self.init_logits = nn.Parameter(torch.zeros(hidden_state_num))  # 均匀初始化
-        self.transition_logits = nn.Parameter(torch.randn(hidden_state_num, hidden_state_num)*0.1)
-        self.emission_logits = nn.Parameter(torch.randn(hidden_state_num, token_num)*0.1)
-
-    def forward(self, text_input):
-        batch_size = text_input.shape[0]
-        seq_length = text_input.shape[1]
-
-        # === 1. 将logits转换成概率 ===
-        text_pi = F.softmax(self.init_logits, dim=0)
-        text_A = F.softmax(self.transition_logits, dim=1)
-        text_B = F.softmax(self.emission_logits, dim=1)
-        
-        logger.debug(f"text_pi:{text_pi}")
-        logger.debug(f"text_A: {text_A}")
-        logger.debug(f"text_B: {text_B}")
-        # 计算状态转移矩阵、发射矩阵信息熵
-
-        # === 2. 对数前向算法 （在数值稳定的对数空间进行，因为概率相乘数值会越来越小） ===
-        log_pi = torch.log(text_pi + 1e-10)
-        log_A = torch.log(text_A + 1e-10)
-        log_B = torch.log(text_B + 1e-10)
-
-        log_likelihoods = torch.full((batch_size, seq_length), -float('inf'), device = text_input.device)
-
-        # 对于第一个观测计算初始对数概率和似然
-        log_alpha = log_pi + log_B[:, text_input[:,0]].T  # [batch_size, hidden_state_num]
-        log_likelihoods[:, 0] = torch.logsumexp(log_alpha, dim=1)
-
-        for t in range(1, seq_length):     # log_alpha:之前所有token和当前状态的概率
-
-            # 先计算状态转移项，log_alpha_prev + log_A 
-            transition_term = log_alpha.unsqueeze(2) + log_A.unsqueeze(0)  # [batch_size, hidden_state_num, hidden_state_num]   
-            
-            log_alpha = torch.logsumexp(transition_term, dim=1) + log_B[:, text_input[:, t]].T # [batch_size, hidden_state_num]
-            
-            log_likelihoods[:, t] = torch.logsumexp(log_alpha, dim=1)   # [batch_size,]
-
-    
-        # === 3. 计算批量负对数似然损失 ===
-        batch_indices = torch.arange(batch_size, device=text_input.device) # 为每个batch生成索引序号(0,1,2...batch_size-1)
-        log_likelihood = log_likelihoods[batch_indices, seq_length-1]
-        likelihood_loss = -log_likelihood.mean()
-
-        # === 4. 正则化项 ===
-        # (1) 计算状态转移矩阵每行的熵
-        transition_entropy = -torch.sum(text_A * torch.log(text_A + 1e-10), dim=1)  # [hidden_state_num]
-        transition_entropy_loss = transition_entropy.mean() * 0.1  # 熵的平均值
-
-        # (2) 非对角线列和下限约束，增强连通性
-        col_sums = text_A.sum(dim=0)  # 每列总和
-        colsum_reg = torch.sum(F.relu(self.colsum_threshold - col_sums)) * 1
-
-        # === 5. 总损失 ===
-        hmm_loss = likelihood_loss + transition_entropy_loss + colsum_reg
-
-        return text_pi, text_A, text_B, hmm_loss
+from math import sqrt
 
 # FlattenHead：展平并输出预测结果
 class FlattenHead(nn.Module):
@@ -179,24 +92,26 @@ class TSCluster(nn.Module):
           熵损失 entropy_loss
           中间输出特征提取结果emb_all:[bs*n_vars, patch_num, hidden_dim], 以便后续进行crossattention使用  
     """
-    def __init__(self, bkb_kargs, hidden_dim, cluster_num, patch_num):
+    def __init__(self, bkb_cls, bkb_kargs, hidden_dim, cluster_num, patch_num, text_init_logits, text_transition_logits):
         super(TSCluster, self).__init__()
         self.cluster_num = cluster_num
         self.patch_num = patch_num
 
-        """实例化一个 Transformer Encoder: self.bkb"""
-        self.bkb = nn.TransformerEncoder(**bkb_kargs)
+        # 特征提取网络 Backbone（使用 Transformer Encoder）
+        self.bkb = bkb_cls(**bkb_kargs)
 
         """实例化 ClusterCenters: self.cluster_centers"""
         self.cluster_centers = ClusterCenters(hidden_dim, cluster_num)
-    
-    def forward(self, input_series, text_pi, text_A):   # input_series: [bs*n_vars, patch_num, patch_len]
-        emb_ts = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
-        logits_all = self.cluster_centers(emb_ts)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
-        
-        ts_pi = text_pi
-        ts_A = text_A
 
+        # 可训练HMM状态转移矩阵、初始状态分布 
+        self.ts_init_logits = nn.Parameter(text_init_logits)
+        self.ts_transition_logits = nn.Parameter(text_transition_logits)
+
+    def forward(self, input_series):   # input_series: [bs*n_vars, patch_num, patch_len]
+        ts_pi = torch.softmax(self.ts_init_logits, dim=0)
+        ts_A = torch.softmax(self.ts_transition_logits, dim=1)
+        emb_all = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
+        logits_all = self.cluster_centers(emb_all)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
         logit_t = torch.tile(ts_pi, (logits_all.shape[0], 1))  # self.ts_pi 复制到批次大小（B） [bs*n_vars, cluster_num]
         all_logit_result = []
         # 初始时间步0：直接用初始状态和第一个patch的概率分布
@@ -212,18 +127,17 @@ class TSCluster(nn.Module):
         cluster_probs = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
         # 计算熵损失，鼓励概率分布集中
         entropy_loss = -torch.sum(cluster_probs * torch.log(cluster_probs + 1e-10), dim=-1).mean()
-        return cluster_probs, emb_ts, ts_pi, ts_A, entropy_loss
+        return cluster_probs, emb_all, entropy_loss
 
-
-"""将时间序列 patch 与文本 token embeddings 进行 cross-attention 并加权融合, 100个类使用了100个CrossAttentionLayer实例"""
 class TSAligner(nn.Module):
     """
     输入: TSCluster返回的cluster_probs, emb_all。cluster_probs: 聚类软标签概率, 形状[B, patch_num, cluster_num]  ts_emb: 时间序列patch嵌入, 形状[B, patch_num, d_model]  
     输出: fused_emb: [B, patch_num, d_llm] - 融合后的嵌入
     """
-    def __init__(self, cluster_num, d_model, n_heads, d_llm, attention_dropout=0.1):
+    def __init__(self, topk_token_embeddings, cluster_num, d_model, n_heads, d_llm, attention_dropout=0.1):
         super(TSAligner, self).__init__()
         self.cluster_num = cluster_num
+        self.topk_token_embeddings = topk_token_embeddings  # [cluster_num, topk, d_llm]
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_llm = d_llm
@@ -234,15 +148,18 @@ class TSAligner(nn.Module):
             for _ in range(cluster_num)
         ])
 
-    def forward(self, topk_token_embeddings, ts_emb, cluster_probs):   
+    def forward(self, ts_emb, cluster_probs):   
         B, P, _ = ts_emb.shape  # [B, patch_num, d_model]
         aligned_embs = []
+
         # 对每个聚类进行注意力对齐
         for c in range(self.cluster_num):
             # 获取当前聚类的 top-k token embeddings
-            text_emb = topk_token_embeddings[c]  # 第c个cluster的topk_token_embedding  [topk, d_llm]
+            text_emb = self.topk_token_embeddings[c]  # 第c个cluster的topk_token_embedding  [topk, d_llm]
+
             # 使用 CrossAttentionLayer 计算对齐嵌入
             aligned = self.crossattention_layers[c](ts_emb, text_emb, text_emb)  # 一段时间序列整个和一个聚类里的topk_token进行注意力计算, scores:[B, H, patch_num, topk]，得到融合文本特征的 [B, patch_num, d_llm]
+
             # 根据聚类概率加权
             weight = cluster_probs[:, :, c].unsqueeze(-1)  # [B, patch_num, 1]
             aligned_embs.append(aligned * weight)  # [B, patch_num, d_llm]
@@ -250,7 +167,7 @@ class TSAligner(nn.Module):
         # 融合所有聚类的加权嵌入
         fused_emb = sum(aligned_embs)  # [B, patch_num, d_llm]
         return fused_emb
-    
+
 class CrossAttentionLayer(nn.Module):
     """
     input:
@@ -305,7 +222,7 @@ class CrossAttentionLayer(nn.Module):
 
 # 主模型类
 class Model(nn.Module):
-    def __init__(self, configs, patch_len=16, stride=8, cluster_num=100, topk=1000, token_num=50003):
+    def __init__(self, configs, patch_len=16, stride=8, cluster_num=100, topk=1000):
         super(Model, self).__init__()
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
@@ -313,37 +230,30 @@ class Model(nn.Module):
         self.d_ff = configs.d_ff  
         self.d_llm = configs.llm_dim
         self.d_model = configs.d_model
-        self.patch_len = patch_len
-        self.stride = stride
+        self.patch_len = configs.patch_len
+        self.stride = configs.stride
         self.cluster_num = cluster_num
         self.topk = topk
         self.n_heads = configs.n_heads
-        self.epoch_init_logits = None
-        self.epoch_transition_logits = None
-        self.epoch_emission_logits = None  # 为vali阶段保存需要的发射矩阵
 
-        # 计算 patch_num，考虑填充
-        self.patch_num = (self.seq_len + self.stride - self.patch_len) // self.stride + 1
-        if self.patch_num <= 0:
-            raise ValueError(f"Invalid patch configuration: seq_len={self.seq_len}, patch_len={self.patch_len}, stride={self.stride}")
-
+        # 设置设备
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         
-        self.gpt2_config = GPT2Config.from_pretrained(r'gpt2')
+        self.gpt2_config = GPT2Config.from_pretrained(r"exp2\gpt2")
         self.gpt2_config.num_hidden_layers = configs.llm_layers
         self.gpt2_config.output_attentions = True
         self.gpt2_config.output_hidden_states = True
-    
+            
         self.llm_model = GPT2Model.from_pretrained(
-                    r'gpt2',
-                    local_files_only=True,
-                    config=self.gpt2_config,
-                )
+            r"exp2\gpt2",
+            local_files_only=True,
+            config=self.gpt2_config,)
+        
         self.tokenizer = GPT2Tokenizer.from_pretrained(
-                    r'gpt2',
-                    local_files_only=True
-                )
+            r"exp2\gpt2",
+            local_files_only=True)
+            
         if self.tokenizer.eos_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
@@ -359,19 +269,37 @@ class Model(nn.Module):
 
         self.dropout = nn.Dropout(configs.dropout)
 
+        # 计算 patch_num，考虑填充
+        self.patch_num = (self.seq_len + self.stride - self.patch_len) // self.stride + 1
+        if self.patch_num <= 0:
+            raise ValueError(f"Invalid patch configuration: seq_len={self.seq_len}, patch_len={self.patch_len}, stride={self.stride}")
+
         # 获取 LLM 的全部词嵌入
         self.word_embeddings = self.llm_model.get_input_embeddings().weight  # [50256, d_llm]
 
+        # 加载HMM参数
+        text_init_logits = torch.load(r"exp3\ts\hmm\init_logits.pt").detach()
+        text_transition_logits = torch.load(r"exp3\ts\hmm\transition_logits.pt").detach()
+        text_emission_logits = torch.load(r"exp3\ts\hmm\emission_logits.pt").detach()
+        text_B = torch.softmax(text_emission_logits, dim=1).to(self.device)  # [cluster_num, local_vocab_size]
+
         # 加载gpt2_to_local_id字典
-        gpt2_to_local_id = torch.load(r'D:\SGCMA\exp2\utils\gpt2_to_local_id.pt')
+        gpt2_to_local_id = torch.load(r"exp3\ts\hmm\gpt2_to_local_id.pt")
         # 创建local_to_gpt2映射tensor
         max_local_id = max(gpt2_to_local_id.values())  # 本地token_id的最大值
         self.local_to_gpt2 = torch.zeros(max_local_id + 1, dtype=torch.long, device=self.device)
         for local_id, gpt2_id in enumerate([gpt2_to_local_id[k] for k in sorted(gpt2_to_local_id.keys())]):
             self.local_to_gpt2[local_id] = gpt2_id
 
-        """实例化 WikiHMM 模块: self.wiki_hmm"""
-        self.wiki_hmm = WikiHMM(self.cluster_num, configs.colsum_threshold)
+        # 获取每个状态的top-k本地token indices
+        _, topk_local_indices = torch.topk(text_B, k=topk, dim=1)  # [cluster_num, topk]
+
+        # 将本地token indices映射回GPT-2 token ID
+        topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
+        
+        # 为每个状态提取 top-k token embeddings
+        self.topk_token_embeddings = self.word_embeddings[topk_gpt2_indices]
+
 
         """实例化 Normalize 模块: self.normalize_layers"""
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
@@ -380,15 +308,16 @@ class Model(nn.Module):
         self.patching = Patching(self.patch_len, self.stride)
 
         """在输入TransformerEncoder前, 需要先将它投影到d_model"""
-        self.patch_projection = nn.Linear(patch_len, self.d_model)
+        self.patch_projection = nn.Linear(self.patch_len, self.d_model)
 
         """实例化 TSCluster 模块: self.ts_cluster"""
+        bkb_cls = nn.TransformerEncoder
         bkb_kargs = {'encoder_layer': nn.TransformerEncoderLayer(d_model=configs.d_model, nhead=configs.n_heads),
                      'num_layers': configs.e_layers}
-        self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num)
+        self.ts_cluster = TSCluster(bkb_cls, bkb_kargs, configs.d_model, cluster_num, self.patch_num, text_init_logits, text_transition_logits)
 
         """实例化 TSAligner 模块: self.ts_aligner"""
-        self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=0.1)
+        self.ts_aligner = TSAligner(self.topk_token_embeddings, cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=0.1)
 
         """用在GPT2最后一个隐藏层输出, 先进行一步降维到d_ff=32"""
         self.projection = nn.Linear(self.d_llm, self.d_ff)
@@ -398,83 +327,45 @@ class Model(nn.Module):
         self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout)
         
         
-    def forward(self, x_enc=None, x_mark_enc=None, x_dec=None, x_mark_dec=None, text_input=None, is_pretrain=False):   
-        if is_pretrain:
-            _, _, _, hmm_loss= self.wiki_hmm(text_input)
-            return hmm_loss
-        else:
-            dec_out, hmm_loss, entropy_loss = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, text_input)
-            return dec_out[:, -self.pred_len:, :], hmm_loss, entropy_loss
-    
+    def forward(self, x_enc):   
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            dec_out, entropy_loss = self.forecast(x_enc)
+            return dec_out[:, -self.pred_len:, :], entropy_loss   # 只返回预测结果（dec_out）的最后 self.pred_len 个时间步，即只返回模型需要预测的未来时间步的结果
+        return None, None
         
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, text_input=None):
-        # 训练时
-        if text_input is not None:
-            """调用 wiki_hmm 模块: self.wiki_hmm"""
-            text_pi, text_A, text_B, hmm_loss = self.wiki_hmm(text_input)
+    def forecast(self, x_enc):
+        """原始输入 x_enc: [bs, seq_len, n_vars]"""
 
-            """原始输入 x_enc: [bs, seq_len, n_vars]"""
+        """调用 Normalize 模块: self.normalize_layers"""
+        x_enc = self.normalize_layers(x_enc, 'norm')  # [bs, seq_len, n_vars]
+        B, T, N = x_enc.size()
+        x_enc = x_enc.permute(0, 2, 1).contiguous()  # [bs, n_vars, seq_len]
 
-            """调用 Normalize 模块: self.normalize_layers"""
-            x_enc = self.normalize_layers(x_enc, 'norm')  # [bs, seq_len, n_vars]
-            B, T, N = x_enc.size()
-            x_enc = x_enc.permute(0, 2, 1).contiguous()  # [bs, n_vars, seq_len]
+        """调用 Patching 模块: self.patching"""
+        x_patched, n_vars = self.patching(x_enc)  # [bs*n_vars, patch_num, patch_len]
+        
+        """调用 self.patch_projection"""
+        enc_out = self.patch_projection(x_patched) # [bs*n_vars, patch_num, d_model]
 
-            """调用 Patching 模块: self.patching"""
-            x_patched, n_vars = self.patching(x_enc)  # [bs*n_vars, patch_num, patch_len]
-            
-            """调用 self.patch_projection"""
-            enc_out = self.patch_projection(x_patched) # [bs*n_vars, patch_num, d_model]
+        """调用 TSCluster 模块: self.ts_cluster"""
+        cluster_probs, ts_embedding, entropy_loss = self.ts_cluster(enc_out)  # [bs*n_vars, patch_num, cluster_num]
 
-            """调用 TSCluster 模块: self.ts_cluster"""
-            cluster_probs, ts_embedding, ts_pi, ts_A, entropy_loss = self.ts_cluster(enc_out, text_pi, text_A)  # [bs*n_vars, patch_num, cluster_num]
+        """调用 TSAligner 模块: self.ts_aligner"""
+        fused_emb = self.ts_aligner(ts_embedding, cluster_probs)  # [bs*n_vars, patch_num, d_llm]
 
-            """获取word embedding"""
-            _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1)
-            # 直接用tensor索引映射到gpt2_id
-            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
-            topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] 
+        """ 输入 LLM """
+        dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  # [bs*n_vars, patch_num, d_llm]
+        """调用 self.projection, 将GPT2隐藏层输出先进行一次降维"""
+        dec_out = self.projection(dec_out)  # [bs*n_vars, patch_num, d_ff]
 
-            """调用 TSAligner 模块: self.ts_aligner"""
-            fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs)  # [bs*n_vars, patch_num, d_llm]
-            
-            """ 输入 LLM """
-            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  # [bs*n_vars, patch_num, d_llm]
-            """调用 self.projection, 将GPT2隐藏层输出先进行一次降维"""
-            dec_out = self.projection(dec_out)  # [bs*n_vars, patch_num, d_ff]
+        # 重塑形状
+        dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
+        dec_out = dec_out.permute(0, 1, 3, 2).contiguous()  # [bs, n_vars, d_ff, patch_num]
 
-            # 重塑形状
-            dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
-            dec_out = dec_out.permute(0, 1, 3, 2).contiguous()  # [bs, n_vars, d_ff, patch_num]
+        """调用 FlattenHead 模块: self.output_projection"""
+        dec_out = self.output_projection(dec_out)  # [bs, n_vars, pred_len]
 
-            """调用 FlattenHead 模块: self.output_projection"""
-            dec_out = self.output_projection(dec_out)  # [bs, n_vars, pred_len]
-
-            dec_out = dec_out.permute(0, 2, 1).contiguous()  # [bs, pred_len, n_vars]
-            dec_out = self.normalize_layers(dec_out, 'denorm')
-            return dec_out, hmm_loss, entropy_loss
-        else:
-            text_pi = F.softmax(self.epoch_init_logits.to(self.device), dim=0)
-            text_A = F.softmax(self.epoch_transition_logits.to(self.device), dim =1)
-            text_B = F.softmax(self.epoch_emission_logits.to(self.device), dim=1)
-            hmm_loss = 0
-
-            _, topk_local_indices = torch.topk(text_B, k = self.topk, dim=1)
-            topk_gpt2_indices = self.local_to_gpt2[topk_local_indices]
-            topk_token_embeddings = self.word_embeddings[topk_gpt2_indices] 
-
-            x_enc = self.normalize_layers(x_enc, 'norm')  
-            B, T, N = x_enc.size()
-            x_enc = x_enc.permute(0, 2, 1).contiguous()  
-            x_patched, n_vars = self.patching(x_enc) 
-            enc_out = self.patch_projection(x_patched)
-            cluster_probs, ts_embedding, ts_pi, ts_A, entropy_loss = self.ts_cluster(enc_out,text_pi,text_A)
-            fused_emb = self.ts_aligner(topk_token_embeddings, ts_embedding, cluster_probs) 
-            dec_out = self.llm_model(inputs_embeds=fused_emb).last_hidden_state  
-            dec_out = self.projection(dec_out)  
-            dec_out = torch.reshape(dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
-            dec_out = dec_out.permute(0, 1, 3, 2).contiguous() 
-            dec_out = self.output_projection(dec_out)  
-            dec_out = dec_out.permute(0, 2, 1).contiguous()  
-            dec_out = self.normalize_layers(dec_out, 'denorm')
-            return dec_out, hmm_loss, entropy_loss
+        dec_out = dec_out.permute(0, 2, 1).contiguous()  # [bs, pred_len, n_vars]
+        dec_out = self.normalize_layers(dec_out, 'denorm')
+        return dec_out, entropy_loss
+    

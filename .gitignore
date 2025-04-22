@@ -1,0 +1,14 @@
+.history/
+.history/*
+.vscode/
+dataset/
+gpt2/
+pretrain_model/
+wikidata/
+hmm/
+checkpoints/
+log/
+layers/__pycache__/__init__.cpython-39.pyc
+models/__pycache__/__init__.cpython-39.pyc
+models/__pycache__/SGCMA.cpython-39.pyc
+utils/__pycache__/tools.cpython-39.pyc
