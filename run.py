@@ -117,9 +117,9 @@ def parse_args():
     parser.add_argument('--diag_max', '-dmx', type=float, default=0.7, help='diag max')
     parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4, help='optimizer learning rate')
     parser.add_argument('--eval_interval_iters', '-eii', type=int, default=-1, help='max epochs')
-    parser.add_argument('--load_checkpoint', '-lc', type=int, default=1, help='load checkpoint')
+    parser.add_argument('--load_checkpoint', '-lc', type=int, default=0, help='load checkpoint')
     parser.add_argument('--batch_size', '-bs', type=int, default=32, help='batch size of train input data')
-    parser.add_argument('--device', type=str, default='cuda:3', help='device')
+    parser.add_argument('--device', type=str, default='cuda:0', help='device')
     parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
     parser.add_argument('--train_trans', '-tt', type=int, default=1, help='train transition matrix')
 
@@ -194,6 +194,7 @@ def main():
         mse_metric = nn.MSELoss()
         mae_metric = nn.L1Loss()
 
+        check_load_flag = 0
         if args.load_checkpoint:
 
             checkpoint_path = os.path.join(check_pth, 'checkpoint')
@@ -203,13 +204,16 @@ def main():
                     checkpoint = torch.load(checkpoint_path, map_location=device)
                     model.load_state_dict(checkpoint, strict=False)  # 加载模型状态
                     print(f"Loaded from {checkpoint_path}")
+                    check_load_flag = 1
                 except Exception as e:
                     print(f"Error loading checkpoint: {e}")
-                    print("No checkpoint found. Starting Phase 1 from scratch.")    
+                    print("No checkpoint found. Starting Phase 1 from scratch.")   
             else:
                 print("No checkpoint found. Starting from scratch.")  
+
         else:
             print("No checkpoint found. Starting from scratch.")  
+
 
         _, text_dataloader = text_data_provider(args)
 
@@ -271,7 +275,7 @@ def main():
         best_vali_mse = float('inf')
         best_test_mae = float('inf')
         best_vali_mae = float('inf')
-        if args.train_trans:
+        if args.train_trans and not check_load_flag:
             model._init_trans_pi()
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
