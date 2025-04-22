@@ -52,12 +52,12 @@ def parse_args():
     parser.add_argument('--is_training', type=int, default=1, help='status')
     parser.add_argument('--model', type=str, default='SGCMA', help='model name')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
-    parser.add_argument('--gpt2_path', type=str, default=r"exp2\gpt2", help='root path of gpt2')
+    parser.add_argument('--gpt2_path', type=str, default=r"gpt2", help='root path of gpt2')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
 
     # data loader
     parser.add_argument('--data', type=str, default='ETTh1', help='datasets type')
-    parser.add_argument('--root_path', type=str, default=r"exp3\ts\datasets\ETT-small", help='root path of the data file')
+    parser.add_argument('--root_path', type=str, default=r"dataset\ETT-small", help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; '
@@ -72,7 +72,7 @@ def parse_args():
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
     parser.add_argument('--label_len', type=int, default=0, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=720, help='prediction sequence length')
+    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 
     # model define
@@ -196,6 +196,8 @@ def main():
                     train_loss += loss.cpu().detach().item()
                     train_mae_loss += mae_loss.cpu().detach().item()
                     train_entropy_loss += entropy_loss.cpu().detach().item()
+                    
+                    torch.cuda.empty_cache()
 
             vali_mse_loss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
             test_mse_loss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
