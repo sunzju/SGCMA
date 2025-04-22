@@ -81,7 +81,7 @@ def parse_args():
     parser.add_argument('--checkpoints', type=str, default='checkpoints', help='location of model checkpoints')
 
     # forecasting task
-    parser.add_argument('--seq_len', '-sl', type=int, default=336, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
+
     parser.add_argument('--label_len', type=int, default=0, help='start token length')
     parser.add_argument('--pred_len', '-pl', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
@@ -94,20 +94,20 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
-    parser.add_argument('--stride', type=int, default=16, help='stride')
+    parser.add_argument('--stride', type=int, default=8, help='stride')
     parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model')
     parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')
 
-    parser.add_argument('--seed', type=int, default=2025, help='random seed')
+    parser.add_argument('--seed', type=int, default=2021, help='random seed')
     parser.add_argument('--d_model', '-dm', type=int, default=128, help='dimension of TSCluster Transformer Encoder ')
     parser.add_argument('--n_heads', '-nh', type=int, default=8, help='num of heads')
     parser.add_argument('--e_layers', '-el', type=int, default=2, help='num of encoder layers')
     parser.add_argument('--d_ff', '-df', type=int, default=32, help='dimension of fcn')
-    parser.add_argument('--temperature', '-tp', type=float, default=1.0, help='temperature')
+    parser.add_argument('--temperature', '-tp', type=float, default=0.25, help='temperature')
     parser.add_argument('--cluster_num', '-cn', type=int, default=100, help='cluster number')
-    parser.add_argument('--topk', '-tk', type=int, default=128, help='topk')
+    parser.add_argument('--topk', '-tk', type=int, default=1000, help='topk')
     parser.add_argument('--topkmode', '-tkm', type=str, default='select', help='select or all')
-    parser.add_argument('--loss_mode', '-lm', type=str, default='mae+hmm', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
+    parser.add_argument('--loss_mode', '-lm', type=str, default='mae', help='mse, mse+hmm, mse+entropy, mse+hmm+entropy')
     parser.add_argument('--hmm_reg', '-hr', type=float, default=0.1, help='hmm regularization')
     parser.add_argument('--entropy_reg', '-er', type=float, default=1, help='entropy regularization')
     parser.add_argument('--hmm_pretrained_flag', '-hpf', type=int, default=1, help='is pretrain')
@@ -116,10 +116,13 @@ def parse_args():
     parser.add_argument('--linear_layer', '-ll', type=int, default=1, help='linear layer')
     parser.add_argument('--diag_max', '-dmx', type=float, default=0.7, help='diag max')
     parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4, help='optimizer learning rate')
-    parser.add_argument('--eval_interval_iters', '-eii', type=int, default=100, help='max epochs')
-    parser.add_argument('--load_checkpoint', '-lc', type=int, default=0, help='load checkpoint')
-    parser.add_argument('--batch_size', '-bs', type=int, default=128, help='batch size of train input data')
+    parser.add_argument('--eval_interval_iters', '-eii', type=int, default=-1, help='max epochs')
+    parser.add_argument('--load_checkpoint', '-lc', type=int, default=1, help='load checkpoint')
+    parser.add_argument('--batch_size', '-bs', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--device', type=str, default='cuda:3', help='device')
+    parser.add_argument('--seq_len', '-sl', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
+    parser.add_argument('--train_trans', '-tt', type=int, default=1, help='train transition matrix')
+
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
@@ -161,10 +164,10 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}'.format(
+        setting = '{}_{}_{}_{}_ft{}_sl{}_pl{}_dm{}_nh{}_el{}_df{}_cn{}_tk{}_lm{}_tp{}_hr{}_er{}_lr{}_hpm{}_lln{}_ei{}_bs{}_tt{}'.format(
             args.task_name, args.model_id, args.model, args.data, args.features,
             args.seq_len, args.pred_len, args.d_model, args.n_heads,
-            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size)
+            args.e_layers, args.d_ff, args.cluster_num, args.topk, args.loss_mode, args.temperature, args.hmm_reg, args.entropy_reg, args.learning_rate, args.hmm_pretrain_mode, args.linear_layer, args.eval_interval_iters, args.batch_size, args.train_trans)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -268,6 +271,8 @@ def main():
         best_vali_mse = float('inf')
         best_test_mae = float('inf')
         best_vali_mae = float('inf')
+        if args.train_trans:
+            model._init_trans_pi()
         for epoch in range(args.train_epochs):  
             if early_stopping.early_stop:
                 break
@@ -317,30 +322,35 @@ def main():
                 model_optim.step()
 
                 train_loss += loss.cpu().detach().item()
-                train_hmm_loss += likelihood_loss.cpu().detach().item()
+                train_hmm_loss += likelihood_loss.cpu().detach().item() if isinstance(likelihood_loss, torch.Tensor) else likelihood_loss
                 train_mseloss += mseloss.cpu().detach().item()
-                train_entropy_loss += entropy_loss.cpu().detach().item()
+                train_entropy_loss += entropy_loss.cpu().detach().item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss
                 train_maeloss += maeloss.cpu().detach().item()
 
                 torch.cuda.empty_cache()
 
                 pbar.set_postfix({
                     'mse': mseloss.cpu().detach().item(),  
-                    'entropy_loss': entropy_loss.cpu().detach().item(),                     
-                    'hmm_loss': likelihood_loss.cpu().detach().item(),
+                    'entropy_loss': entropy_loss.cpu().detach().item() if isinstance(entropy_loss, torch.Tensor) else entropy_loss,                     
+                    'hmm_loss': likelihood_loss.cpu().detach().item() if isinstance(likelihood_loss, torch.Tensor) else likelihood_loss,
                     'mae': maeloss.cpu().detach().item()
                 })
 
-                if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1:
+                if batch_idx % args.eval_interval_iters == args.eval_interval_iters - 1 and args.eval_interval_iters != -1:
                     vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
                     test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
                     best_vali_mse, best_vali_mae, best_test_mse, best_test_mae = logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth)
 
-                    if early_stopping.early_stop:
-                        logger.info("Early stopping")
-                        break
+
 
            
+            if args.eval_interval_iters == -1:
+                vali_mseloss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
+                test_mseloss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
+                best_vali_mse, best_vali_mae, best_test_mse, best_test_mae = logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth)
+                if early_stopping.early_stop:
+                    logger.info("Early stopping")
+                    break
 
             logger.info(f"Epoch {epoch + 1} | Train Total Loss: {train_loss / len(train_loader):.7f} | "
                   f"HMM Loss: {train_hmm_loss / len(train_loader):.7f} | "

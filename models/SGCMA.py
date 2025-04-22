@@ -197,6 +197,10 @@ class TSCluster(nn.Module):
             self.transition_matrix = nn.Parameter(torch.randn(cluster_num, cluster_num))
             self.init_logits = nn.Parameter(torch.randn(cluster_num))
     
+    def _init_trans_pi(self, transition_matrix, init_logits):
+        self.transition_matrix.data = transition_matrix
+        self.init_logits.data = init_logits
+    
     def forward(self, input_series, log_pi=None, log_A=None):   # input_series: [bs*n_vars, patch_num, patch_len]
         emb_ts = self.bkb(input_series)  # 提取特征 [bs*n_vars, patch_num, hidden_dim]
         logits_all = self.cluster_centers(emb_ts)  # 聚类概率分布 [bs*n_vars, patch_num, cluster_num] 
@@ -212,8 +216,7 @@ class TSCluster(nn.Module):
         all_logit_result = []
         # 初始时间步0：直接用初始状态和第一个patch的概率分布
         log_t = log_pi + logits_all[:, 0]  # 
-        log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
-        # logit_t = torch.softmax(logit_t, dim=1) # 归一化
+        # log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
         all_logit_result.append(log_t)
         # 后续时间步
         for t in range(1, self.patch_num):
@@ -222,9 +225,12 @@ class TSCluster(nn.Module):
             log_t = log_t + logits_all[:, t]
             log_t = log_t - torch.logsumexp(log_t, dim=-1, keepdim=True)
             all_logit_result.append(log_t)
-        cluster_probs = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
-        entropy_loss_patch_mean = -torch.sum(torch.exp(cluster_probs) * cluster_probs, dim=-1).mean()
-        cluster_probs = torch.exp(cluster_probs)
+        cluster_probs_log = torch.stack(all_logit_result, dim=1)   # [bs*n_vars, patch_num, cluster_num]
+        # cluster_probs_log = cluster_probs_log - torch.logsumexp(cluster_probs_log, dim=-1, keepdim=True)
+        cluster_probs = torch.exp(cluster_probs_log)
+        # cluster_probs = torch.softmax(cluster_probs, dim=-1)
+        entropy_loss_patch_mean = -torch.sum(cluster_probs * cluster_probs_log, dim=-1).mean()
+        
         # 计算熵损失，鼓励概率分布集中
 
         # mean_prob_each_cluster = torch.mean(cluster_probs, dim=-2)
@@ -401,6 +407,7 @@ class Model(nn.Module):
         self.epoch_init_logits = None
         self.epoch_transition_logits = None
         self.epoch_emission_logits = None  # 为vali阶段保存需要的发射矩阵
+        self.train_trans = configs.train_trans
 
         # 计算 patch_num，考虑填充
         self.patch_num = (self.seq_len + self.stride - self.patch_len) // self.stride + 1
@@ -412,7 +419,7 @@ class Model(nn.Module):
         
         self.gpt2_config = GPT2Config.from_pretrained(r'gpt2')
         self.gpt2_config.num_hidden_layers = configs.llm_layers
-        self.gpt2_config.output_attentions = True
+        self.gpt2_config.output_attentions = False
         self.gpt2_config.output_hidden_states = True
     
         self.llm_model = GPT2Model.from_pretrained(
@@ -480,7 +487,7 @@ class Model(nn.Module):
         """实例化 TSCluster 模块: self.ts_cluster"""
         bkb_kargs = {'encoder_layer': nn.TransformerEncoderLayer(d_model=configs.d_model, nhead=configs.n_heads),
                      'num_layers': configs.e_layers}
-        self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num)
+        self.ts_cluster = TSCluster(bkb_kargs, configs.d_model, self.cluster_num, self.patch_num, train_trans=configs.train_trans)
 
         """实例化 TSAligner 模块: self.ts_aligner"""
         self.ts_aligner = TSAligner(self.cluster_num, configs.d_model, self.n_heads, self.d_llm, attention_dropout=configs.dropout, temperature=configs.temperature)
@@ -497,7 +504,9 @@ class Model(nn.Module):
         self.head_nf = self.d_ff * self.valid_patch
         self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len, head_dropout=configs.dropout, linear_layer=configs.linear_layer)
         
-        
+    def _init_trans_pi(self):
+        self.ts_cluster._init_trans_pi(self.wiki_hmm.transition_logits.data, self.wiki_hmm.init_logits.data)
+    
     def forward(self, x_enc=None, text_input=None, is_pretrain=False):   
         if is_pretrain:
             _, _, _, likelihood_loss, transition_entropy_loss, cnct_const, diag_reg, self_trans_const = self.wiki_hmm(text_input)
@@ -511,7 +520,10 @@ class Model(nn.Module):
         # 训练时
         if text_input is not None:
             """调用 wiki_hmm 模块: self.wiki_hmm"""
-            log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
+            if not self.train_trans:
+                log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = self.wiki_hmm(text_input)
+            else:
+                log_pi, log_A, log_B, likelihood_loss, transition_entropy_loss, cnct_const, _, _ = None, None, self.wiki_hmm.emission_logits, 0, 0, 0, None, None
 
             """原始输入 x_enc: [bs, seq_len, n_vars]"""
 

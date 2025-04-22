@@ -222,11 +222,11 @@ def test(args,  model, train_loader, vali_loader, criterion):
 def logging_vali_result(model, epoch, best_vali_mse, best_vali_mae, best_test_mse, best_test_mae, vali_mseloss, vali_mae_loss, test_mseloss, test_mae_loss, logger, early_stopping, check_pth):
     if vali_mseloss < best_vali_mse:
         best_vali_mse = vali_mseloss
-    if test_mseloss < best_test_mse:
+    # if test_mseloss < best_test_mse:
         best_test_mse = test_mseloss
-    if vali_mae_loss < best_vali_mae:
+    # if vali_mae_loss < best_vali_mae:
         best_vali_mae = vali_mae_loss
-    if test_mae_loss < best_test_mae:
+    # if test_mae_loss < best_test_mae:
         best_test_mae = test_mae_loss
     logger.info(f"Epoch {epoch + 1} | V MSE Loss: {vali_mseloss:.7f} | V MAE Loss: {vali_mae_loss:.7f} | T MSE Loss: {test_mseloss:.7f} | T MAE Loss: {test_mae_loss:.7f} | Best V MSE: {best_vali_mse:.7f} | Best V MAE: {best_vali_mae:.7f} | Best T MSE: {best_test_mse:.7f} | Best T MAE: {best_test_mae:.7f}")
     early_stopping(vali_mseloss, model, check_pth)
