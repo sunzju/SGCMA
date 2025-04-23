@@ -10,11 +10,11 @@ def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
     if args.lradj == 'type1':
         lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
     elif args.lradj == 'type2':
-        lr_adjust = {2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6, 10: 5e-7, 15: 1e-7, 20: 5e-8}
+        lr_adjust = {1: 1e-4, 2: 5e-5, 3: 5e-5, 4: 1e-5, 5: 5e-6, 6: 1e-6, 7: 5e-7}
     elif args.lradj == 'type3':   #
         lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
     elif args.lradj == 'PEMS':
-        lr_adjust = {epoch: args.learning_rate * (0.95 ** (epoch // 1))}
+        lr_adjust = {epoch: args.learning_rate * (0.5 ** (epoch // 1))}
     elif args.lradj == 'TST':   #
         lr_adjust = {epoch: scheduler.get_last_lr()[0]}
     elif args.lradj == 'constant':   # traffic \ electricity
@@ -33,7 +33,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         self.delta = delta
         self.save_mode = save_mode
 
@@ -87,8 +87,7 @@ class StandardScaler:
     def inverse_transform(self, data):
         return (data * self.std) + self.mean
 
-def vali(args, model, vali_data, vali_loader, mse_metric, mae_metric):
-    device = next(model.parameters()).device
+def vali(args, model, vali_data, vali_loader, mse_metric, mae_metric, device):
     
     total_mse_loss = 0.0
     total_mae_loss = 0.0
@@ -96,7 +95,7 @@ def vali(args, model, vali_data, vali_loader, mse_metric, mae_metric):
 
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, _, _) in tqdm(enumerate(vali_loader)):
+        for i, (batch_x, batch_y, _, _) in enumerate(vali_loader):
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
 
@@ -115,6 +114,7 @@ def vali(args, model, vali_data, vali_loader, mse_metric, mae_metric):
             total_entropy_loss += entropy_loss.cpu().detach().item()
             total_mse_loss += mse_loss.cpu().detach().item()
             total_mae_loss += mae_loss.cpu().detach().item()
+            print(f'[{i}/{len(vali_loader)}]', end='\r')
     
     total_mse_loss = total_mse_loss / len(vali_loader)
     total_mae_loss = total_mae_loss / len(vali_loader)

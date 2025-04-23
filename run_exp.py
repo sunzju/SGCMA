@@ -52,12 +52,13 @@ def parse_args():
     parser.add_argument('--is_training', type=int, default=1, help='status')
     parser.add_argument('--model', type=str, default='SGCMA', help='model name')
     parser.add_argument('--seed', type=int, default=2021, help='random seed')
-    parser.add_argument('--gpt2_path', type=str, default=r"gpt2", help='root path of gpt2')
+    parser.add_argument('--gpt2_path', type=str, default="gpt2", help='root path of gpt2')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
+    parser.add_argument('--model_comment', type=str, default='1118', help='prefix when saving test results')
 
     # data loader
     parser.add_argument('--data', type=str, default='ETTh1', help='datasets type')
-    parser.add_argument('--root_path', type=str, default=r"dataset\ETT-small", help='root path of the data file')
+    parser.add_argument('--root_path', type=str, default="dataset/ETT-small", help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument('--features', type=str, default='M',
                         help='forecasting task, options:[M, S, MS]; '
@@ -72,7 +73,7 @@ def parse_args():
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')   # 每条样本长度是seq_len，再对样本分patch
     parser.add_argument('--label_len', type=int, default=0, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
+    parser.add_argument('--pred_len', type=int, default=336, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
 
     # model define
@@ -100,10 +101,10 @@ def parse_args():
     parser.add_argument('--train_epochs', type=int, default=50, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--eval_interval_iters', type=int, default=400, help='max epochs')
-    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='optimizer learning rate')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
-    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
+    parser.add_argument('--lradj', type=str, default='PEMS', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
     parser.add_argument('--llm_layers', type=int, default=6)
     parser.add_argument('--percent', type=int, default=100)
@@ -126,8 +127,8 @@ def main():
 
     for ii in range(args.itr):
         # 设置实验记录
-        setting = '{}_{}_ft{}_sl{}_pl{}_lr{}_lradj{}_{}'.format(
-            args.task_name, args.data, args.features, args.seq_len, args.pred_len, args.learning_rate, args.lradj, ii)
+        setting = '{}_{}_ft{}_sl{}_pl{}_lr{}_lradj{}_{}_cmt{}'.format(
+            args.task_name, args.data, args.features, args.seq_len, args.pred_len, args.learning_rate, args.lradj, ii, args.model_comment)
         print(setting)
         logger = makeup_logging(setting)
 
@@ -164,43 +165,44 @@ def main():
 
             model.train()
             model_optim.zero_grad()
+            epcoh_start_t = time.time()
 
-            with tqdm(train_loader, desc=f"Train Epoch {epoch + 1}") as pbar:
-                for batch_idx, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pbar):
-                    iter_count += 1
+            for batch_idx, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
 
-                    # 数据移动到设备
-                    batch_x = batch_x.float().to(device)
-                    batch_y = batch_y.float().to(device)
+                # 数据移动到设备
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
 
-                    # 前向传播
-                    outputs, entropy_loss = model(batch_x)
-                    f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:]
+                # 前向传播
+                outputs, entropy_loss = model(batch_x)
+                f_dim = -1 if args.features == 'MS' else 0
+                outputs = outputs[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:]
 
-                    # 计算损失
-                    mae_loss = mae_metric(outputs, batch_y)  
-                    loss = mae_loss + entropy_loss  # 总损失
+                # 计算损失
+                mae_loss = mae_metric(outputs, batch_y)  
+                loss = mae_loss + entropy_loss  # 总损失
 
-                    pbar.set_postfix({
-                        'mae': mae_loss.cpu().detach().item(),  
-                        'entropy_loss': entropy_loss.cpu().detach().item()                    
-                    })
 
-                    # 反向传播和优化
-                    model_optim.zero_grad()
-                    mae_loss.backward()
-                    model_optim.step()
 
-                    train_loss += loss.cpu().detach().item()
-                    train_mae_loss += mae_loss.cpu().detach().item()
-                    train_entropy_loss += entropy_loss.cpu().detach().item()
+                # 反向传播和优化
+                model_optim.zero_grad()
+                mae_loss.backward()
+                model_optim.step()
+
+                train_loss += loss.cpu().detach().item()
+                train_mae_loss += mae_loss.cpu().detach().item()
+                train_entropy_loss += entropy_loss.cpu().detach().item()
+                if batch_idx % 20 == 0:
+                    print(f"Epoch {epoch + 1} [{batch_idx}/{len(train_loader)}, {time.time() - epcoh_start_t:.2f}s]| Train MAE Loss: {train_mae_loss / (batch_idx + 1):.7f} | "f"Train Entropy Loss: {train_entropy_loss / (batch_idx + 1):.7f}", end='\r')
                     
-                    torch.cuda.empty_cache()
+                    # torch.cuda.empty_cache()
 
-            vali_mse_loss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric)
-            test_mse_loss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric)
+            vali_mse_loss, vali_mae_loss = vali(args, model, vali_data, vali_loader, mse_metric, mae_metric, device)
+            test_mse_loss, test_mae_loss = vali(args, model, test_data, test_loader, mse_metric, mae_metric, device)
+            print('')
+            adjust_learning_rate(model_optim, None, epoch + 1, args)
 
             logger.info(f"Epoch {epoch + 1} | Train MAE Loss: {train_mae_loss / len(train_loader):.7f} | "f"Vali MSE Loss: {vali_mse_loss:.7f} | Test MSE Loss:{test_mse_loss:.7f} | Test MAE Loss:{test_mae_loss:.7f}")
 

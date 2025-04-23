@@ -299,7 +299,7 @@ class Model(nn.Module):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         
-        self.gpt2_config = GPT2Config.from_pretrained(r"gpt2")
+        self.gpt2_config = GPT2Config.from_pretrained("gpt2")
         self.gpt2_config.num_hidden_layers = configs.llm_layers
         self.gpt2_config.output_attentions = False
         self.gpt2_config.output_hidden_states = True
@@ -337,13 +337,13 @@ class Model(nn.Module):
         self.word_embeddings = self.llm_model.get_input_embeddings().weight  # [50256, d_llm]
 
         # 加载HMM参数
-        text_init_logits = torch.load(r"hmm\init_logits.pt").detach()
-        text_transition_logits = torch.load(r"hmm\transition_logits.pt").detach()
-        text_emission_logits = torch.load(r"hmm\emission_logits.pt").detach()
+        text_init_logits = torch.load("hmm/init_logits.pt").detach()
+        text_transition_logits = torch.load("hmm/transition_logits.pt").detach()
+        text_emission_logits = torch.load("hmm/emission_logits.pt").detach()
         text_B = torch.softmax(text_emission_logits, dim=1).to(self.device)  # [cluster_num, local_vocab_size]
 
         # 加载gpt2_to_local_id字典
-        gpt2_to_local_id = torch.load(r"hmm\gpt2_to_local_id.pt")
+        gpt2_to_local_id = torch.load("hmm/gpt2_to_local_id.pt", weights_only=False)
         # 创建local_to_gpt2映射tensor
         max_local_id = max(gpt2_to_local_id.values())  # 本地token_id的最大值
         self.local_to_gpt2 = torch.zeros(max_local_id + 1, dtype=torch.long, device=self.device)
